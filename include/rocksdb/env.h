@@ -253,6 +253,14 @@ class Env : public Customizable {
     WLTH_MEDIUM,       // Data written has a medium life time
     WLTH_LONG,         // Data written has a long life time
     WLTH_EXTREME,      // Data written has an extremely long life time
+    // Level-based lifetime hints (Level 0-6)
+    WLTH_LEVEL0,       // Level 0 files
+    WLTH_LEVEL1,       // Level 1 files
+    WLTH_LEVEL2,       // Predicted lifetime: [50, 100) seconds
+    WLTH_LEVEL3,       // Predicted lifetime: [100, 150) seconds
+    WLTH_LEVEL4,       // Predicted lifetime: [150, 200) seconds
+    WLTH_LEVEL5,       // Predicted lifetime: [200, 400) seconds
+    WLTH_LEVEL6,       // Predicted lifetime: [400, +∞) seconds
   };
 
   // Create an object that writes to a new file with the specified
