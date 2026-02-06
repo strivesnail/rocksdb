@@ -83,6 +83,7 @@ class Version;
 class VersionEdit;
 class VersionSet;
 class WriteCallback;
+class TwoPhaseWriteManager;
 struct JobContext;
 struct ExternalSstFileInfo;
 struct MemTableInfo;
@@ -1416,6 +1417,9 @@ class DBImpl : public DB {
 
   // Unified interface for logging events
   EventLogger event_logger_;
+
+  // Two-phase write manager for ML-driven compaction
+  std::unique_ptr<TwoPhaseWriteManager> two_phase_write_manager_;
 
   // only used for dynamically adjusting max_total_wal_size. it is a sum of
   // [write_buffer_size * max_write_buffer_number] over all column families

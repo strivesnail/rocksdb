@@ -9,6 +9,8 @@
 
 #include "db/version_set.h"
 
+#include "db/event_helpers_ml_features.h"
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -5275,33 +5277,15 @@ Env::WriteLifeTimeHint VersionStorageInfo::CalculateSSTWriteHint(
     return Env::WLTH_NOT_SET;
   }
 
-  switch (compaction_style_) {
-    case kCompactionStyleLevel:
-      if (level == 0) {
-        return Env::WLTH_MEDIUM;
-      }
-
-      // L1: medium, L2: long, ...
-      if (level - base_level_ >= 2) {
-        return Env::WLTH_EXTREME;
-      } else if (level < base_level_) {
-        // There is no restriction which prevents level passed in to be smaller
-        // than base_level.
-        return Env::WLTH_MEDIUM;
-      }
-      return static_cast<Env::WriteLifeTimeHint>(
-          level - base_level_ + static_cast<int>(Env::WLTH_MEDIUM));
-    case kCompactionStyleUniversal:
-      if (level == 0) {
-        return Env::WLTH_SHORT;
-      }
-      if (level == 1) {
-        return Env::WLTH_MEDIUM;
-      }
-      return Env::WLTH_LONG;
-    default:
-      return Env::WLTH_NOT_SET;
+  // Simple mapping: each level maps to its corresponding WLTH_LEVEL
+  // Level 0 → WLTH_LEVEL0, Level 1 → WLTH_LEVEL1, ..., Level 6 → WLTH_LEVEL6
+  if (level >= 0 && level <= 6) {
+    return static_cast<Env::WriteLifeTimeHint>(
+        static_cast<int>(Env::WLTH_LEVEL0) + level);
   }
+
+  // Fallback for levels outside 0-6 range
+  return Env::WLTH_LEVEL6;
 }
 
 void Version::AddLiveFiles(std::vector<uint64_t>* live_table_files,

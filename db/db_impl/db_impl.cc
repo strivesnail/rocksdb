@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "db/db_impl/db_impl.h"
 
+#include "db/two_phase_write_manager.h"
+
 #include <cstdint>
 #ifdef OS_SOLARIS
 #include <alloca.h>
@@ -718,6 +720,15 @@ Status DBImpl::CloseHelper() {
 Status DBImpl::CloseImpl() { return CloseHelper(); }
 
 DBImpl::~DBImpl() {
+  // Shutdown TwoPhaseWriteManager
+  if (two_phase_write_manager_) {
+    two_phase_write_manager_->Shutdown();
+    // Clear global singleton
+    if (g_two_phase_write_manager == two_phase_write_manager_.get()) {
+      g_two_phase_write_manager = nullptr;
+    }
+  }
+  
   ThreadStatus::OperationType cur_op_type =
       ThreadStatusUtil::GetThreadOperation();
   ThreadStatusUtil::SetThreadOperation(ThreadStatus::OperationType::OP_UNKNOWN);

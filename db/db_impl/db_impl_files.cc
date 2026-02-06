@@ -13,6 +13,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/event_helpers.h"
 #include "db/memtable_list.h"
+#include "db/two_phase_write_manager.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "file/sst_file_manager_impl.h"
@@ -372,6 +373,8 @@ void DBImpl::DeleteObsoleteFileImpl(int job_id, const std::string& fname,
   TEST_SYNC_POINT_CALLBACK("DBImpl::DeleteObsoleteFileImpl::BeforeDeletion",
                            const_cast<std::string*>(&fname));
   IGNORE_STATUS_IF_ERROR(Status::IOError());
+
+  // 已移除：不再拦截文件删除，由RocksDB正常管理文件删除
 
   Status file_deletion_status;
   if (type == kTableFile || type == kBlobFile || type == kWalFile) {

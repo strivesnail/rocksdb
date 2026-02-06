@@ -733,6 +733,8 @@ set(SOURCES
         db/dbformat.cc
         db/error_handler.cc
         db/event_helpers.cc
+        db/event_helpers_ml_features.cc
+        db/two_phase_write_manager.cc
         db/experimental.cc
         db/external_sst_file_ingestion_job.cc
         db/file_indexer.cc

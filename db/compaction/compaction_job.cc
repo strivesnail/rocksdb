@@ -27,7 +27,9 @@
 #include "db/dbformat.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "db/event_helpers_ml_features.h"
 #include "db/history_trimming_iterator.h"
+#include "db/two_phase_write_manager.h"
 #include "db/log_writer.h"
 #include "db/merge_helper.h"
 #include "db/range_del_aggregator.h"
@@ -2125,6 +2127,114 @@ Status CompactionJob::FinishCompactionOutputFile(
       TableFileCreationReason::kCompaction, status_for_listener, file_checksum,
       file_checksum_func_name);
 
+  // ML-driven two-phase write: collect features, predict, and rewrite if needed
+  // This must be done BEFORE OnAddFile to ensure file is at target path
+  if (s.ok() && meta != nullptr) {
+    int output_level = sub_compact->compaction->output_level();
+    TwoPhaseWriteManager* local_manager = g_two_phase_write_manager;
+    
+    fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " level=%d\n", output_number, output_level);
+    fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: local_manager=%p\n", (void*)local_manager);
+    if (local_manager) {
+      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: initialized=%d phase2_enabled=%d\n",
+              local_manager->IsInitialized() ? 1 : 0, local_manager->IsPhase2Enabled() ? 1 : 0);
+    }
+    fflush(stderr);
+    
+    bool use_temp_output = false;
+    
+    // Check if we used temp output (same logic as in OpenCompactionOutputFile)
+    if (local_manager && local_manager->IsInitialized() && 
+        local_manager->IsPhase2Enabled() && output_level > 0) {
+      use_temp_output = true;
+      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - use_temp_output=true\n", output_number);
+    } else {
+      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - use_temp_output=false\n", output_number);
+    }
+    fflush(stderr);
+    
+    // Only calculate features and predict if Phase 2 is enabled
+    if (local_manager && local_manager->IsInitialized() && 
+        local_manager->IsPhase2Enabled()) {
+      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - Phase2 enabled, calculating features...\n", output_number);
+      fflush(stderr);
+      
+      // Calculate ML features - NO ERROR TOLERANCE
+      uint64_t file_size_for_features = meta->fd.file_size;
+      if (file_size_for_features == 0) {
+        fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - file_size=0, using fallback\n", output_number);
+        TableProperties tp_fallback = outputs.GetTableProperties();
+        if (tp_fallback.raw_key_size > 0 || tp_fallback.raw_value_size > 0) {
+          file_size_for_features = tp_fallback.data_size;
+        }
+      }
+      
+      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - file_size_for_features=%" PRIu64 "\n", 
+              output_number, file_size_for_features);
+      fflush(stderr);
+      
+      MLFeatures features;
+      bool features_ok = CalculateMLFeatures(
+          meta->fd, meta->smallest, meta->largest,
+          file_size_for_features, current_entries,
+          output_level, cfd, &features, db_mutex_);
+      
+      // NO ERROR TOLERANCE - features calculation must succeed
+      if (!features_ok) {
+        fprintf(stderr, "[FATAL] FinishCompactionOutputFile: file #%" PRIu64 " - CalculateMLFeatures failed! This is a fatal error!\n", output_number);
+        fflush(stderr);
+        abort();  // FAIL IMMEDIATELY
+      }
+      
+      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - ✓ Features calculated successfully\n", output_number);
+      fflush(stderr);
+      
+      // Convert MLFeatures to 69-element double array
+      std::vector<double> features_array(69);
+      MLFeaturesToArray(features, features_array.data(), features_array.size());
+      
+      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - Calling CollectFeaturesAndPredict...\n", output_number);
+      fflush(stderr);
+      
+      // Collect features and predict - NO ERROR TOLERANCE
+      Status predict_status = local_manager->CollectFeaturesAndPredict(
+          output_number, output_level, features_array);
+      
+      if (!predict_status.ok()) {
+        fprintf(stderr, "[FATAL] FinishCompactionOutputFile: file #%" PRIu64 " - CollectFeaturesAndPredict failed: %s\n",
+                output_number, predict_status.ToString().c_str());
+        fflush(stderr);
+        abort();  // FAIL IMMEDIATELY
+      }
+      
+      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - ✓ Prediction successful\n", output_number);
+      fflush(stderr);
+      
+      // If prediction succeeded and we used temp output, rewrite to target handle
+      if (use_temp_output) {
+        fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - use_temp_output=true, calling RewriteFileToTargetHandle...\n", output_number);
+        fflush(stderr);
+        
+        Status rewrite_status = local_manager->RewriteFileToTargetHandle(output_number);
+        if (!rewrite_status.ok()) {
+          fprintf(stderr, "[FATAL] FinishCompactionOutputFile: file #%" PRIu64 " - RewriteFileToTargetHandle failed: %s\n",
+                  output_number, rewrite_status.ToString().c_str());
+          fflush(stderr);
+          abort();  // FAIL IMMEDIATELY
+        }
+        
+        fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - ✓ File rewritten to target handle\n", output_number);
+        fflush(stderr);
+      } else {
+        fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - use_temp_output=false, skipping rewrite\n", output_number);
+        fflush(stderr);
+      }
+    } else {
+      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " - Phase2 not enabled or manager not initialized, skipping ML features\n", output_number);
+      fflush(stderr);
+    }
+  }
+
   // Report new file to SstFileManagerImpl
   auto sfm =
       static_cast<SstFileManagerImpl*>(db_options_.sst_file_manager.get());
@@ -2367,6 +2477,46 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       "CompactionJob::OpenCompactionOutputFile::NewFileNumber", &file_number);
 #endif
   std::string fname = GetTableFileName(file_number);
+  
+  // Check if we should write to tmp directory (Phase 2 mode)
+  int output_level = sub_compact->compaction->output_level();
+  TwoPhaseWriteManager* local_manager = g_two_phase_write_manager;
+  
+  fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: file #%" PRIu64 " level=%d\n", file_number, output_level);
+  fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: local_manager=%p\n", (void*)local_manager);
+  if (local_manager) {
+    fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: initialized=%d phase2_enabled=%d\n",
+            local_manager->IsInitialized() ? 1 : 0, local_manager->IsPhase2Enabled() ? 1 : 0);
+  }
+  fflush(stderr);
+  
+  bool use_temp_output = false;
+  
+  if (local_manager && local_manager->IsInitialized() && 
+      local_manager->IsPhase2Enabled()) {
+    fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: file #%" PRIu64 " - Calling HandleFileCreation...\n", file_number);
+    fflush(stderr);
+    
+    use_temp_output = local_manager->HandleFileCreation(file_number, output_level, fname);
+    
+    fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: file #%" PRIu64 " - HandleFileCreation returned: %s\n",
+            file_number, use_temp_output ? "true (write to tmp)" : "false (write to target)");
+    fflush(stderr);
+    
+    if (use_temp_output) {
+      // Build tmp directory path
+      std::string tmp_dir = dbname_ + "/tmp";
+      fname = MakeTableFileName(tmp_dir, file_number);
+      fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: file #%" PRIu64 " - Using tmp path: %s\n", file_number, fname.c_str());
+    } else {
+      fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: file #%" PRIu64 " - Using target path: %s\n", file_number, fname.c_str());
+    }
+    fflush(stderr);
+  } else {
+    fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: file #%" PRIu64 " - Phase2 not enabled or manager not initialized, using target path: %s\n", file_number, fname.c_str());
+    fflush(stderr);
+  }
+  
   // Fire events.
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
   EventHelpers::NotifyTableFileCreationStarted(
@@ -2523,6 +2673,12 @@ void CopyPrefix(const Slice& src, size_t prefix_length, std::string* dst) {
   assert(prefix_length > 0);
   size_t length = src.size() > prefix_length ? prefix_length : src.size();
   dst->assign(src.data(), length);
+}
+
+// Helper function to get WriteLifeTimeHint from ML prediction
+[[maybe_unused]] static Env::WriteLifeTimeHint WriteHintFromPrediction(
+    double lifetime_seconds, int output_level) {
+  return MapLifetimeToHint(lifetime_seconds, output_level);
 }
 }  // namespace
 
