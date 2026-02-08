@@ -723,9 +723,16 @@ DBImpl::~DBImpl() {
   // Shutdown TwoPhaseWriteManager
   if (two_phase_write_manager_) {
     two_phase_write_manager_->Shutdown();
-    // Clear global singleton
+    // Clear global singleton ONLY if it matches this instance
+    // This prevents clearing the global variable if a new DB instance has already been opened
     if (g_two_phase_write_manager == two_phase_write_manager_.get()) {
+      fprintf(stderr, "[DBImpl::~DBImpl] Clearing global singleton: %p\n", (void*)g_two_phase_write_manager);
+      fflush(stderr);
       g_two_phase_write_manager = nullptr;
+    } else {
+      fprintf(stderr, "[DBImpl::~DBImpl] NOT clearing global singleton (different instance): current=%p, global=%p\n", 
+              (void*)two_phase_write_manager_.get(), (void*)g_two_phase_write_manager);
+      fflush(stderr);
     }
   }
   

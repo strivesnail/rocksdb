@@ -48,11 +48,25 @@ static bool g_python_initialized = false;
 
 static bool InitializePythonMLPredictor() {
   std::call_once(g_python_init_flag, []() {
+    fprintf(stderr, "[Python ML] ========== Starting Python ML Predictor Initialization ==========\n");
+    fflush(stderr);
+    
     if (!Py_IsInitialized()) {
+      fprintf(stderr, "[Python ML] Step 1: Py_IsInitialized() = false, calling Py_Initialize()...\n");
+      fflush(stderr);
       Py_Initialize();
       if (!Py_IsInitialized()) {
+        fprintf(stderr, "[Python ML] ERROR: Py_Initialize() failed!\n");
+        fflush(stderr);
         return;
       }
+      fprintf(stderr, "[Python ML] Step 1: Py_Initialize() succeeded\n");
+      fflush(stderr);
+      // Note: We keep GIL during initialization because we need to call Python APIs
+      // GIL will be released after initialization is complete
+    } else {
+      fprintf(stderr, "[Python ML] Step 1: Py_IsInitialized() = true, Python already initialized\n");
+      fflush(stderr);
     }
 
     PyObject* sys_path = PySys_GetObject("path");
@@ -67,32 +81,70 @@ static bool InitializePythonMLPredictor() {
     PyList_Append(sys_path, path);
     Py_DECREF(path);
 
+    fprintf(stderr, "[Python ML] Step 2: Importing module 'ml_predict_lifetime_by_level'...\n");
+    fflush(stderr);
     g_ml_predict_module = PyImport_ImportModule("ml_predict_lifetime_by_level");
     if (!g_ml_predict_module) {
+      fprintf(stderr, "[Python ML] ERROR: Failed to import module 'ml_predict_lifetime_by_level'\n");
+      fflush(stderr);
       PyErr_Print();
       return;
     }
+    fprintf(stderr, "[Python ML] Step 2: Module imported successfully\n");
+    fflush(stderr);
 
+    fprintf(stderr, "[Python ML] Step 3: Getting function 'predict_file_lifetime_by_level'...\n");
+    fflush(stderr);
     g_predict_func = PyObject_GetAttrString(
         g_ml_predict_module, "predict_file_lifetime_by_level");
     if (!g_predict_func || !PyCallable_Check(g_predict_func)) {
+      fprintf(stderr, "[Python ML] ERROR: Failed to get or validate 'predict_file_lifetime_by_level' function\n");
+      fflush(stderr);
       Py_XDECREF(g_predict_func);
       g_predict_func = nullptr;
       return;
     }
+    fprintf(stderr, "[Python ML] Step 3: Function 'predict_file_lifetime_by_level' obtained successfully\n");
+    fflush(stderr);
 
+    fprintf(stderr, "[Python ML] Step 4: Calling 'initialize' function...\n");
+    fflush(stderr);
     PyObject* init_func =
         PyObject_GetAttrString(g_ml_predict_module, "initialize");
     if (init_func && PyCallable_Check(init_func)) {
       PyObject* result = PyObject_CallObject(init_func, nullptr);
       if (result) {
         g_python_initialized = PyObject_IsTrue(result);
+        fprintf(stderr, "[Python ML] Step 4: 'initialize' returned: %s\n", 
+                g_python_initialized ? "True" : "False");
+        fflush(stderr);
         Py_DECREF(result);
+      } else {
+        fprintf(stderr, "[Python ML] ERROR: 'initialize' call returned NULL\n");
+        fflush(stderr);
+        if (PyErr_Occurred()) {
+          PyErr_Print();
+          PyErr_Clear();
+        }
       }
       Py_DECREF(init_func);
+    } else {
+      fprintf(stderr, "[Python ML] WARNING: 'initialize' function not found or not callable\n");
+      fflush(stderr);
     }
 
     g_python_initialized = (g_predict_func != nullptr);
+    fprintf(stderr, "[Python ML] ========== Initialization completed: %s ==========\n",
+            g_python_initialized ? "SUCCESS" : "FAILED");
+    fflush(stderr);
+    
+    // CRITICAL: Release GIL after initialization is complete
+    // This allows background threads (compaction threads) to acquire GIL via PyGILState_Ensure()
+    if (g_python_initialized) {
+      PyEval_SaveThread();  // Release GIL in main thread
+      fprintf(stderr, "[Python ML] Step 5: Released GIL in main thread for multi-threading support\n");
+      fflush(stderr);
+    }
   });
 
   return g_python_initialized;
@@ -4032,53 +4084,148 @@ bool InitializeMLPredictorByLevel() {
 double PredictFileLifetimePythonByLevel(const double* features,
                                         size_t feature_count, int level) {
 #ifdef ROCKSDB_ML_PREDICT_PYTHON
-  if (!InitializePythonMLPredictor() || !g_predict_func) {
+  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 函数入口 (level=%d, features_count=%zu)\n", 
+          level, feature_count);
+  fflush(stderr);
+  
+  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 检查InitializePythonMLPredictor...\n");
+  fflush(stderr);
+  bool init_ok = InitializePythonMLPredictor();
+  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: InitializePythonMLPredictor=%d, g_predict_func=%p\n", 
+          init_ok, (void*)g_predict_func);
+  fflush(stderr);
+  
+  if (!init_ok || !g_predict_func) {
+    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: 初始化检查失败，返回0.0\n");
+    fflush(stderr);
     return 0.0;
   }
+  
+  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 初始化检查通过，继续执行\n");
+  fflush(stderr);
 
   int model_level = level;
   if (model_level < 1) {
+    fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: model_level < 1, 返回0.0\n");
+    fflush(stderr);
     return 0.0;
   }
   if (model_level > 6) {
+    fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: model_level > 6, 调整为6\n");
+    fflush(stderr);
     model_level = 6;
   }
 
-  PyObject* features_list = PyList_New(feature_count);
+  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 准备获取GIL (model_level=%d)\n", model_level);
+  fflush(stderr);
+
+  // CRITICAL: Acquire GIL for thread-safe Python calls
+  // RocksDB compaction runs in background threads, so we must acquire GIL
+  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 调用 PyGILState_Ensure()...\n");
+  fflush(stderr);
+  PyGILState_STATE gstate = PyGILState_Ensure();
+  
+  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: PyGILState_Ensure() 返回，gstate=%d\n", (int)gstate);
+  fflush(stderr);
+  
+  PyObject* features_list = nullptr;
+  PyObject* level_obj = nullptr;
+  PyObject* args = nullptr;
+  PyObject* result = nullptr;
+  double predicted_lifetime = -1.0;
+
+  // 进程池日志已移除
+
+  // Build features list
+  features_list = PyList_New(feature_count);
   if (!features_list) {
-    return 0.0;
+    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: PyList_New failed\n");
+    fflush(stderr);
+    PyGILState_Release(gstate);
+    return -1.0;
   }
   
   for (size_t i = 0; i < feature_count; ++i) {
     PyObject* item = PyFloat_FromDouble(features[i]);
     if (!item) {
+      fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: PyFloat_FromDouble failed at index %zu\n", i);
+      fflush(stderr);
       Py_DECREF(features_list);
-      return 0.0;
+      PyGILState_Release(gstate);
+      return -1.0;
     }
     PyList_SetItem(features_list, i, item);
   }
 
-  PyObject* level_obj = PyLong_FromLong(model_level);
-  PyObject* args = PyTuple_New(2);
+  // Build arguments tuple
+  level_obj = PyLong_FromLong(model_level);
+  if (!level_obj) {
+    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: PyLong_FromLong failed\n");
+    fflush(stderr);
+    Py_DECREF(features_list);
+    PyGILState_Release(gstate);
+    return -1.0;
+  }
+  
+  args = PyTuple_New(2);
+  if (!args) {
+    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: PyTuple_New failed\n");
+    fflush(stderr);
+    Py_DECREF(features_list);
+    Py_DECREF(level_obj);
+    PyGILState_Release(gstate);
+    return -1.0;
+  }
+  
   PyTuple_SetItem(args, 0, features_list);  // features first (matching Python function signature)
   PyTuple_SetItem(args, 1, level_obj);  // level second
 
-  PyObject* result = PyObject_CallObject(g_predict_func, args);
+  fprintf(stderr, "[VERIFY] PredictFileLifetimePythonByLevel: 调用 PyObject_CallObject...\n");
+  fflush(stderr);
+  
+  result = PyObject_CallObject(g_predict_func, args);
+  
+  fprintf(stderr, "[VERIFY] PredictFileLifetimePythonByLevel: PyObject_CallObject 返回: %p\n", (void*)result);
+  fflush(stderr);
+  
   Py_DECREF(args);
 
   if (!result) {
-    PyErr_Print();
-    return 0.0;
+    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: Python调用失败！\n");
+    fflush(stderr);
+    if (PyErr_Occurred()) {
+      PyErr_Print();
+      // 清理错误状态，避免影响后续调用
+      PyErr_Clear();
+    }
+    PyGILState_Release(gstate);
+    // 不要返回 0.0，返回一个负值表示失败
+    return -1.0;
   }
 
-  double predicted_lifetime = PyFloat_AsDouble(result);
+  fprintf(stderr, "[VERIFY] PredictFileLifetimePythonByLevel: Python调用成功，转换返回值...\n");
+  fflush(stderr);
+  
+  predicted_lifetime = PyFloat_AsDouble(result);
   
   // Check for Python error after conversion
   if (PyErr_Occurred()) {
+    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: 返回值转换时发生Python错误！\n");
+    fflush(stderr);
     PyErr_Print();
+    // 清理错误状态，避免影响后续调用
+    PyErr_Clear();
+    Py_DECREF(result);
+    PyGILState_Release(gstate);
+    return -1.0;
   }
   
+  // 进程池日志已移除
+  
   Py_DECREF(result);
+  
+  // Release GIL before returning
+  PyGILState_Release(gstate);
   
   return predicted_lifetime;
 #else
