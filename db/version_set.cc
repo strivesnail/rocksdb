@@ -4262,6 +4262,32 @@ void VersionStorageInfo::UpdateNumNonEmptyLevels() {
 }
 
 namespace {
+// Compute overlapping bytes between a file range and files in another level.
+// Uses exact same logic as SortFileByOverlappingRatio for consistency.
+// Overlap: other.largest >= file_smallest AND other.smallest < file_largest (strict).
+static uint64_t ComputeOverlappingBytesWithLevelImpl(
+    const InternalKey& file_smallest, const InternalKey& file_largest,
+    const std::vector<FileMetaData*>& other_level_files,
+    const InternalKeyComparator& icmp) {
+  uint64_t overlapping_bytes = 0;
+  auto it = other_level_files.begin();
+  // Skip files completely before current file (same as SortFileByOverlappingRatio)
+  while (it != other_level_files.end() &&
+         icmp.Compare((*it)->largest, file_smallest) < 0) {
+    it++;
+  }
+  // Include overlapping files (strict < for upper bound, same as native)
+  while (it != other_level_files.end() &&
+         icmp.Compare((*it)->smallest, file_largest) < 0) {
+    overlapping_bytes += (*it)->fd.file_size;
+    if (icmp.Compare((*it)->largest, file_largest) > 0) {
+      break;
+    }
+    it++;
+  }
+  return overlapping_bytes;
+}
+
 // Sort `temp` based on ratio of overlapping size over file size
 void SortFileByOverlappingRatio(
     const InternalKeyComparator& icmp, const std::vector<FileMetaData*>& files,
@@ -4269,7 +4295,6 @@ void SortFileByOverlappingRatio(
     int level, int num_non_empty_levels, uint64_t ttl,
     std::vector<Fsize>* temp) {
   std::unordered_map<uint64_t, uint64_t> file_to_order;
-  auto next_level_it = next_level_files.begin();
 
   int64_t curr_time;
   Status status = clock->GetCurrentTime(&curr_time);
@@ -4282,23 +4307,9 @@ void SortFileByOverlappingRatio(
                              num_non_empty_levels, level);
 
   for (auto& file : files) {
-    uint64_t overlapping_bytes = 0;
-    // Skip files in next level that is smaller than current file
-    while (next_level_it != next_level_files.end() &&
-           icmp.Compare((*next_level_it)->largest, file->smallest) < 0) {
-      next_level_it++;
-    }
-
-    while (next_level_it != next_level_files.end() &&
-           icmp.Compare((*next_level_it)->smallest, file->largest) < 0) {
-      overlapping_bytes += (*next_level_it)->fd.file_size;
-
-      if (icmp.Compare((*next_level_it)->largest, file->largest) > 0) {
-        // next level file cross large boundary of current file.
-        break;
-      }
-      next_level_it++;
-    }
+    uint64_t overlapping_bytes =
+        ComputeOverlappingBytesWithLevelImpl(file->smallest, file->largest,
+                                             next_level_files, icmp);
 
     uint64_t ttl_boost_score = (ttl > 0) ? ttl_booster.GetBoostScore(file) : 1;
     assert(ttl_boost_score > 0);
@@ -4888,6 +4899,17 @@ uint64_t VersionStorageInfo::NumLevelBytes(int level) const {
   assert(level >= 0);
   assert(level < num_levels());
   return TotalFileSize(files_[level]);
+}
+
+uint64_t VersionStorageInfo::ComputeOverlappingBytesWithLevel(
+    const InternalKey& file_smallest, const InternalKey& file_largest,
+    int other_level, const InternalKeyComparator& icmp) const {
+  if (other_level < 0 || other_level >= num_levels_) {
+    return 0;
+  }
+  const std::vector<FileMetaData*>& other_files = LevelFiles(other_level);
+  return ComputeOverlappingBytesWithLevelImpl(file_smallest, file_largest,
+                                              other_files, icmp);
 }
 
 const char* VersionStorageInfo::LevelSummary(

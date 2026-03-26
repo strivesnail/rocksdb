@@ -157,6 +157,8 @@ enum class CompactionReason : int {
   // [InternalOnly] DBImpl::ReFitLevel treated as a compaction,
   // Used only for internal conflict checking with other compactions
   kRefitLevel,
+  // [Custom] Compaction picked from too-far files (custom compaction path).
+  kLevelTooFarFiles,
   // total number of compaction reasons, new reasons must be added above this.
   kNumOfReasons,
 };

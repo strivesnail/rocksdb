@@ -76,7 +76,8 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
     uint64_t oldest_blob_file_number, const TableProperties& table_properties,
     TableFileCreationReason reason, const Status& s,
     const std::string& file_checksum,
-    const std::string& file_checksum_func_name) {
+    const std::string& file_checksum_func_name,
+    int level) {
   if (!event_logger && listeners.empty()) {
     s.PermitUncheckedError();
     return;
@@ -91,6 +92,11 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
             << Slice(file_checksum).ToString(true) << "file_checksum_func_name"
             << file_checksum_func_name << "smallest_seqno" << fd.smallest_seqno
             << "largest_seqno" << fd.largest_seqno;
+    
+    // 在JSON日志中也添加level信息（如果有效）
+    if (level >= 0) {
+      jwriter << "level" << level;
+    }
 
     // table_properties
     {

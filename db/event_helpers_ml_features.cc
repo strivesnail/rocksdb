@@ -48,102 +48,59 @@ static bool g_python_initialized = false;
 
 static bool InitializePythonMLPredictor() {
   std::call_once(g_python_init_flag, []() {
-    fprintf(stderr, "[Python ML] ========== Starting Python ML Predictor Initialization ==========\n");
-    fflush(stderr);
-    
     if (!Py_IsInitialized()) {
-      fprintf(stderr, "[Python ML] Step 1: Py_IsInitialized() = false, calling Py_Initialize()...\n");
-      fflush(stderr);
       Py_Initialize();
       if (!Py_IsInitialized()) {
-        fprintf(stderr, "[Python ML] ERROR: Py_Initialize() failed!\n");
-        fflush(stderr);
         return;
       }
-      fprintf(stderr, "[Python ML] Step 1: Py_Initialize() succeeded\n");
-      fflush(stderr);
-      // Note: We keep GIL during initialization because we need to call Python APIs
-      // GIL will be released after initialization is complete
-    } else {
-      fprintf(stderr, "[Python ML] Step 1: Py_IsInitialized() = true, Python already initialized\n");
-      fflush(stderr);
     }
 
     PyObject* sys_path = PySys_GetObject("path");
-    // Add path to rocksdb/tools directory where ml_predict_lifetime_by_level.py is located
-    // Use dynamic path based on current executable location or environment variable
     const char* rocksdb_tools_path = std::getenv("ROCKSDB_TOOLS_PATH");
     if (!rocksdb_tools_path) {
-      // Default: assume tools directory is relative to current working directory
       rocksdb_tools_path = "./tools";
     }
     PyObject* path = PyUnicode_FromString(rocksdb_tools_path);
     PyList_Append(sys_path, path);
     Py_DECREF(path);
 
-    fprintf(stderr, "[Python ML] Step 2: Importing module 'ml_predict_lifetime_by_level'...\n");
-    fflush(stderr);
     g_ml_predict_module = PyImport_ImportModule("ml_predict_lifetime_by_level");
     if (!g_ml_predict_module) {
-      fprintf(stderr, "[Python ML] ERROR: Failed to import module 'ml_predict_lifetime_by_level'\n");
-      fflush(stderr);
       PyErr_Print();
       return;
     }
-    fprintf(stderr, "[Python ML] Step 2: Module imported successfully\n");
-    fflush(stderr);
 
-    fprintf(stderr, "[Python ML] Step 3: Getting function 'predict_file_lifetime_by_level'...\n");
-    fflush(stderr);
     g_predict_func = PyObject_GetAttrString(
         g_ml_predict_module, "predict_file_lifetime_by_level");
     if (!g_predict_func || !PyCallable_Check(g_predict_func)) {
-      fprintf(stderr, "[Python ML] ERROR: Failed to get or validate 'predict_file_lifetime_by_level' function\n");
-      fflush(stderr);
       Py_XDECREF(g_predict_func);
       g_predict_func = nullptr;
       return;
     }
-    fprintf(stderr, "[Python ML] Step 3: Function 'predict_file_lifetime_by_level' obtained successfully\n");
-    fflush(stderr);
 
-    fprintf(stderr, "[Python ML] Step 4: Calling 'initialize' function...\n");
-    fflush(stderr);
     PyObject* init_func =
         PyObject_GetAttrString(g_ml_predict_module, "initialize");
+    bool init_success = false;
     if (init_func && PyCallable_Check(init_func)) {
       PyObject* result = PyObject_CallObject(init_func, nullptr);
       if (result) {
-        g_python_initialized = PyObject_IsTrue(result);
-        fprintf(stderr, "[Python ML] Step 4: 'initialize' returned: %s\n", 
-                g_python_initialized ? "True" : "False");
-        fflush(stderr);
+        init_success = PyObject_IsTrue(result);
         Py_DECREF(result);
       } else {
-        fprintf(stderr, "[Python ML] ERROR: 'initialize' call returned NULL\n");
-        fflush(stderr);
         if (PyErr_Occurred()) {
-          PyErr_Print();
           PyErr_Clear();
         }
+        init_success = false;
       }
       Py_DECREF(init_func);
     } else {
-      fprintf(stderr, "[Python ML] WARNING: 'initialize' function not found or not callable\n");
-      fflush(stderr);
+      init_success = (g_predict_func != nullptr);
     }
 
-    g_python_initialized = (g_predict_func != nullptr);
-    fprintf(stderr, "[Python ML] ========== Initialization completed: %s ==========\n",
-            g_python_initialized ? "SUCCESS" : "FAILED");
-    fflush(stderr);
-    
-    // CRITICAL: Release GIL after initialization is complete
-    // This allows background threads (compaction threads) to acquire GIL via PyGILState_Ensure()
+    g_python_initialized = (g_predict_func != nullptr) && init_success;
+
     if (g_python_initialized) {
-      PyEval_SaveThread();  // Release GIL in main thread
-      fprintf(stderr, "[Python ML] Step 5: Released GIL in main thread for multi-threading support\n");
-      fflush(stderr);
+      PyEval_SaveThread();
     }
   });
 
@@ -151,104 +108,17 @@ static bool InitializePythonMLPredictor() {
 }
 #endif
 
-// Helper function to convert InternalKey to numeric value
-// For binary keys (e.g., 8-byte uint64_t), interpret bytes directly as big-endian uint64_t
-// For string keys, try to parse as decimal number or use hash
+// Helper function to convert InternalKey to numeric value (delegates to KeyToNumeric(Slice))
 uint64_t KeyToNumeric(const InternalKey& ikey) {
-  // Check if InternalKey is valid
   if (ikey.unset() || ikey.size() == 0) {
     return 0;
   }
-  
-  Slice user_key = ikey.user_key();
-  // Check if user_key is valid
-  if (user_key.empty()) {
-    return 0;
-  }
-  
-  // For binary keys (common case: 8-byte uint64_t), interpret bytes directly
-  // as big-endian uint64_t
-  if (user_key.size() == sizeof(uint64_t)) {
-    uint64_t result = 0;
-    for (size_t i = 0; i < sizeof(uint64_t); ++i) {
-      result = (result << 8) | static_cast<unsigned char>(user_key[i]);
-    }
-    return result;
-  }
-  
-  // For other sizes, try to interpret as binary (up to 8 bytes)
-  if (user_key.size() <= sizeof(uint64_t)) {
-    uint64_t result = 0;
-    for (size_t i = 0; i < user_key.size(); ++i) {
-      result = (result << 8) | static_cast<unsigned char>(user_key[i]);
-    }
-    return result;
-  }
-  
-  // For string keys, try to parse as number (decimal or hex)
-  // Note: This should rarely be called for binary keys, as they are handled above
-  std::string key_str = user_key.ToString();
-  if (key_str.empty()) {
-    return 0;
-  }
-  
-  try {
-    // Check if string contains hex characters (A-F, a-f)
-    bool has_hex_chars = false;
-    for (char c : key_str) {
-      if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
-        has_hex_chars = true;
-        break;
-      }
-    }
-    
-    uint64_t result = 0;
-    if (has_hex_chars) {
-      // String contains hex characters, try parsing as hex first
-      try {
-        result = std::stoull(key_str, nullptr, 16);
-      } catch (...) {
-        // If hex parsing fails, fall back to decimal
-        if (std::isdigit(static_cast<unsigned char>(key_str[0]))) {
-          result = std::stoull(key_str);
-        } else {
-          // If all parsing fails, use hash
-          uint64_t hash_value = std::hash<std::string>{}(key_str);
-          const uint64_t kMaxReasonableKey = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 2;
-          return hash_value % (kMaxReasonableKey + 1);
-        }
-      }
-    } else if (std::isdigit(static_cast<unsigned char>(key_str[0]))) {
-      // Pure decimal string, parse as decimal
-      result = std::stoull(key_str);
-    } else {
-      // Try to extract numeric suffix (e.g., "key123" -> 123)
-      size_t pos = key_str.find_last_not_of("0123456789");
-      if (pos != std::string::npos && pos + 1 < key_str.size()) {
-        result = std::stoull(key_str.substr(pos + 1));
-      } else {
-        // If no numeric part found, use hash of the key
-        uint64_t hash_value = std::hash<std::string>{}(key_str);
-        const uint64_t kMaxReasonableKey = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 2;
-        return hash_value % (kMaxReasonableKey + 1);
-      }
-    }
-    
-    // Clamp to reasonable range to prevent overflow in distance calculations
-    // Use max of uint32_t * 2 to allow large keys but prevent extreme values
-    // This prevents issues when calculating distances between keys
-    const uint64_t kMaxReasonableKey = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 2;
-    return std::min(result, kMaxReasonableKey);
-  } catch (...) {
-    // If conversion fails, use hash (modulo to prevent extreme values)
-    uint64_t hash_value = std::hash<std::string>{}(key_str);
-    const uint64_t kMaxReasonableKey = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 2;
-    return hash_value % (kMaxReasonableKey + 1);
-  }
+  return KeyToNumeric(ikey.user_key());
 }
 
-// Helper function to calculate file score for kMinOverlappingRatio
-// This is a simplified version that only handles kMinOverlappingRatio
+// Helper function to calculate file score for kMinOverlappingRatio.
+// Uses VersionStorageInfo::ComputeOverlappingBytesWithLevel for exact consistency
+// with RocksDB native SortFileByOverlappingRatio.
 double CalculateFileScoreForMinOverlappingRatio(
     const InternalKey* file_smallest, const InternalKey* file_largest,
     uint64_t file_number, uint64_t compensated_file_size,
@@ -256,129 +126,23 @@ double CalculateFileScoreForMinOverlappingRatio(
     const InternalKeyComparator* icmp, const ImmutableOptions& ioptions,
     const MutableCFOptions& mutable_cf_options, Logger* info_log,
     InstrumentedMutex* db_mutex) {
-  (void)icmp;  // Not needed when using GetOverlappingInputs
   (void)file_number;
   (void)compensated_file_size;
   (void)ioptions;
   (void)mutable_cf_options;
   (void)info_log;
   (void)db_mutex;
-  // Calculate overlapping ratio
   if (level >= vstorage->num_levels() - 1) {
     return 0.0;  // Last level has no next level
   }
-
-  // Use GetOverlappingInputs exactly as RocksDB does in compaction picker
-  // Copy FileDescriptor values while holding mutex to avoid accessing freed memory
-  std::vector<FileDescriptor> next_level_file_descriptors;
-  try {
-    // Validate level before calling
-    int next_level = level + 1;
-    if (next_level < 0 || next_level >= vstorage->num_levels()) {
-      if (info_log) {
-        ROCKS_LOG_ERROR(info_log,
-                        "[ML Features] Invalid next_level %d (level=%d, num_levels=%d), file_number=%" PRIu64,
-                        next_level, level, vstorage->num_levels(), file_number);
-      }
-      return 0.0;
-    }
-    
-    // Note: Mutex is already held by caller (CalculateMLFeatures)
-    // No need to acquire mutex here, but we keep the parameter for interface compatibility
-    
-    // Get overlapping files
-    std::vector<FileMetaData*> next_level_files;
-    next_level_files.reserve(100);
-    vstorage->GetOverlappingInputs(next_level, file_smallest, file_largest,
-                                   &next_level_files);
-    
-    // Debug logging: check if overlapping files were found
-    if (info_log) {
-      ROCKS_LOG_DEBUG(info_log,
-                      "[ML Features] GetOverlappingInputs at next_level=%d found %zu files "
-                      "for file_number=%" PRIu64 " at level=%d (key_range: %s .. %s)",
-                      next_level, next_level_files.size(), file_number, level,
-                      file_smallest->DebugString(true).c_str(),
-                      file_largest->DebugString(true).c_str());
-    }
-    
-    // Immediately copy FileDescriptor values while caller holds mutex
-    // This prevents accessing freed FileMetaData objects
-    next_level_file_descriptors.reserve(next_level_files.size());
-    for (const FileMetaData* next_file : next_level_files) {
-      if (next_file == nullptr) {
-        continue;
-      }
-      try {
-        // Safely copy FileDescriptor by accessing members individually
-        // This minimizes risk of accessing invalid memory
-        FileDescriptor fd_copy;
-        // Access fd members one by one to avoid accessing entire struct at once
-        fd_copy.packed_number_and_path_id = next_file->fd.packed_number_and_path_id;
-        fd_copy.file_size = next_file->fd.file_size;
-        fd_copy.smallest_seqno = next_file->fd.smallest_seqno;
-        fd_copy.largest_seqno = next_file->fd.largest_seqno;
-        fd_copy.table_reader = next_file->fd.table_reader;  // May be nullptr, that's OK
-        next_level_file_descriptors.push_back(fd_copy);
-      } catch (...) {
-        if (info_log) {
-          ROCKS_LOG_ERROR(info_log,
-                          "[ML Features] Exception copying FileDescriptor in "
-                          "next_level_files at level %d, file_number=%" PRIu64,
-                          level + 1, file_number);
-        }
-        // Continue with next file
-      }
-    }
-    // Note: Mutex is still held by caller (CalculateMLFeatures)
-  } catch (...) {
-    if (info_log) {
-      ROCKS_LOG_ERROR(info_log,
-                      "[ML Features] Exception calling GetOverlappingInputs at level %d, file_number=%" PRIu64,
-                      level + 1, file_number);
-    }
-    return 0.0;
-  }
-
-  // Calculate overlapping bytes by summing file sizes
-  // Now we use copied FileDescriptor values, safe from concurrent modification
-  uint64_t overlapping_bytes = 0;
-  for (const FileDescriptor& next_fd : next_level_file_descriptors) {
-    try {
-      overlapping_bytes += next_fd.GetFileSize();
-    } catch (...) {
-      if (info_log) {
-        ROCKS_LOG_ERROR(info_log,
-                        "[ML Features] Exception getting file size from copied "
-                        "FileDescriptor at level %d, file_number=%" PRIu64,
-                        level + 1, file_number);
-      }
-      continue;
-    }
-  }
-
-  // Debug logging: log when overlapping_bytes is 0 to help diagnose score=0 issue
-  if (info_log) {
-    if (overlapping_bytes == 0) {
-      ROCKS_LOG_DEBUG(info_log,
-                      "[ML Features] overlapping_bytes=0 at next_level=%d for "
-                      "file_number=%" PRIu64 " at level=%d (found %zu overlapping files, "
-                      "this will cause score=0)",
-                      level + 1, file_number, level, next_level_file_descriptors.size());
-    } else {
-      ROCKS_LOG_DEBUG(info_log,
-                      "[ML Features] overlapping_bytes=%" PRIu64 " at next_level=%d for "
-                      "file_number=%" PRIu64 " at level=%d (found %zu overlapping files)",
-                      overlapping_bytes, level + 1, file_number, level, next_level_file_descriptors.size());
-    }
-  }
-
-  // Note: TTL boost score calculation removed as it requires FileMetaData
-  // Return overlapping_bytes as the score (compensated_file_size will be handled by caller)
+  uint64_t overlapping_bytes = vstorage->ComputeOverlappingBytesWithLevel(
+      *file_smallest, *file_largest, level + 1, *icmp);
   return static_cast<double>(overlapping_bytes);
 }
 
-// Helper function to calculate passive compaction score
+// Helper function to calculate passive compaction score.
+// Uses VersionStorageInfo::ComputeOverlappingBytesWithLevel for consistency
+// with active score (same overlap logic as SortFileByOverlappingRatio).
 static double CalculatePassiveScoreForMinOverlappingRatio(
     const InternalKey* file_smallest, const InternalKey* file_largest,
     uint64_t file_number, uint64_t compensated_file_size,
@@ -386,127 +150,17 @@ static double CalculatePassiveScoreForMinOverlappingRatio(
     const InternalKeyComparator* icmp, const ImmutableOptions& ioptions,
     const MutableCFOptions& mutable_cf_options, Logger* info_log,
     InstrumentedMutex* db_mutex) {
-  (void)icmp;  // Not needed when using GetOverlappingInputs
   (void)file_number;
   (void)compensated_file_size;
   (void)ioptions;
   (void)mutable_cf_options;
   (void)info_log;
   (void)db_mutex;
-  // Level0 doesn't have a previous level
   if (level == 0) {
-    return 0.0;
+    return 0.0;  // Level0 doesn't have a previous level
   }
-  // Level1 can access Level0 now that we have mutex protection
-
-  // Use GetOverlappingInputs exactly as RocksDB does in compaction picker
-  // Copy FileDescriptor values while holding mutex to avoid accessing freed memory
-  std::vector<FileDescriptor> prev_level_file_descriptors;
-  try {
-    // Validate level before calling
-    int prev_level = level - 1;
-    if (prev_level < 0 || prev_level >= vstorage->num_levels()) {
-      if (info_log) {
-        ROCKS_LOG_ERROR(info_log,
-                        "[ML Features] Invalid prev_level %d (level=%d, num_levels=%d), file_number=%" PRIu64,
-                        prev_level, level, vstorage->num_levels(), file_number);
-      }
-      return 0.0;
-    }
-    
-    // Note: Mutex is already held by caller (CalculateMLFeatures)
-    // No need to acquire mutex here, but we keep the parameter for interface compatibility
-    
-    // Get overlapping files
-    std::vector<FileMetaData*> prev_level_files;
-    prev_level_files.reserve(100);
-    vstorage->GetOverlappingInputs(prev_level, file_smallest, file_largest,
-                                    &prev_level_files);
-    
-    // Debug logging: check if overlapping files were found
-    if (info_log) {
-      ROCKS_LOG_DEBUG(info_log,
-                      "[ML Features] GetOverlappingInputs at prev_level=%d found %zu files "
-                      "for file_number=%" PRIu64 " at level=%d (key_range: %s .. %s)",
-                      prev_level, prev_level_files.size(), file_number, level,
-                      file_smallest->DebugString(true).c_str(),
-                      file_largest->DebugString(true).c_str());
-    }
-    
-    // Immediately copy FileDescriptor values while caller holds mutex
-    // This prevents accessing freed FileMetaData objects
-    prev_level_file_descriptors.reserve(prev_level_files.size());
-    for (const FileMetaData* prev_file : prev_level_files) {
-      if (prev_file == nullptr) {
-        continue;
-      }
-      try {
-        // Safely copy FileDescriptor by accessing members individually
-        // This minimizes risk of accessing invalid memory
-        FileDescriptor fd_copy;
-        // Access fd members one by one to avoid accessing entire struct at once
-        fd_copy.packed_number_and_path_id = prev_file->fd.packed_number_and_path_id;
-        fd_copy.file_size = prev_file->fd.file_size;
-        fd_copy.smallest_seqno = prev_file->fd.smallest_seqno;
-        fd_copy.largest_seqno = prev_file->fd.largest_seqno;
-        fd_copy.table_reader = prev_file->fd.table_reader;  // May be nullptr, that's OK
-        prev_level_file_descriptors.push_back(fd_copy);
-      } catch (...) {
-        if (info_log) {
-          ROCKS_LOG_ERROR(info_log,
-                          "[ML Features] Exception copying FileDescriptor in "
-                          "prev_level_files at level %d, file_number=%" PRIu64,
-                          level - 1, file_number);
-        }
-        // Continue with next file
-      }
-    }
-    // Note: Mutex is still held by caller (CalculateMLFeatures)
-  } catch (...) {
-    if (info_log) {
-      ROCKS_LOG_ERROR(info_log,
-                      "[ML Features] Exception calling GetOverlappingInputs at level %d, file_number=%" PRIu64,
-                      level - 1, file_number);
-    }
-    return 0.0;
-  }
-
-  // Calculate overlapping bytes by summing file sizes
-  // Now we use copied FileDescriptor values, safe from concurrent modification
-  uint64_t overlapping_bytes = 0;
-  for (const FileDescriptor& prev_fd : prev_level_file_descriptors) {
-    try {
-      overlapping_bytes += prev_fd.GetFileSize();
-    } catch (...) {
-      if (info_log) {
-        ROCKS_LOG_ERROR(info_log,
-                        "[ML Features] Exception getting file size from copied "
-                        "FileDescriptor at level %d, file_number=%" PRIu64,
-                        level - 1, file_number);
-      }
-      continue;
-    }
-  }
-
-  // Debug logging: log when overlapping_bytes is 0 to help diagnose score=0 issue
-  if (info_log) {
-    if (overlapping_bytes == 0) {
-      ROCKS_LOG_DEBUG(info_log,
-                      "[ML Features] passive_score overlapping_bytes=0 at prev_level=%d for "
-                      "file_number=%" PRIu64 " at level=%d (found %zu overlapping files, "
-                      "this will cause score=0)",
-                      level - 1, file_number, level, prev_level_file_descriptors.size());
-    } else {
-      ROCKS_LOG_DEBUG(info_log,
-                      "[ML Features] passive_score overlapping_bytes=%" PRIu64 " at prev_level=%d for "
-                      "file_number=%" PRIu64 " at level=%d (found %zu overlapping files)",
-                      overlapping_bytes, level - 1, file_number, level, prev_level_file_descriptors.size());
-    }
-  }
-
-  // Note: TTL boost score calculation removed as it requires FileMetaData
-  // Return overlapping_bytes as the score (compensated_file_size will be handled by caller)
-  // This matches the behavior of CalculateFileScoreForMinOverlappingRatio
+  uint64_t overlapping_bytes = vstorage->ComputeOverlappingBytesWithLevel(
+      *file_smallest, *file_largest, level - 1, *icmp);
   return static_cast<double>(overlapping_bytes);
 }
 
@@ -603,6 +257,110 @@ double CalculateKeyDistance(const FileMetaData* file1,
 }
 
 }  // namespace
+
+uint64_t KeyToNumeric(const Slice& user_key) {
+  if (user_key.empty()) {
+    return 0;
+  }
+  // For binary keys (common case: 8-byte uint64_t), interpret bytes as big-endian
+  if (user_key.size() == sizeof(uint64_t)) {
+    uint64_t result = 0;
+    for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+      result = (result << 8) | static_cast<unsigned char>(user_key[i]);
+    }
+    return result;
+  }
+  if (user_key.size() <= sizeof(uint64_t)) {
+    uint64_t result = 0;
+    for (size_t i = 0; i < user_key.size(); ++i) {
+      result = (result << 8) | static_cast<unsigned char>(user_key[i]);
+    }
+    return result;
+  }
+  // For string keys, try to parse as number or use hash
+  std::string key_str = user_key.ToString();
+  if (key_str.empty()) {
+    return 0;
+  }
+  try {
+    bool has_hex_chars = false;
+    for (char c : key_str) {
+      if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+        has_hex_chars = true;
+        break;
+      }
+    }
+    uint64_t result = 0;
+    if (has_hex_chars) {
+      try {
+        result = std::stoull(key_str, nullptr, 16);
+      } catch (...) {
+        if (std::isdigit(static_cast<unsigned char>(key_str[0]))) {
+          result = std::stoull(key_str);
+        } else {
+          uint64_t hash_value = std::hash<std::string>{}(key_str);
+          const uint64_t kMaxReasonableKey =
+              static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 2;
+          return hash_value % (kMaxReasonableKey + 1);
+        }
+      }
+    } else if (std::isdigit(static_cast<unsigned char>(key_str[0]))) {
+      result = std::stoull(key_str);
+    } else {
+      size_t pos = key_str.find_last_not_of("0123456789");
+      if (pos != std::string::npos && pos + 1 < key_str.size()) {
+        result = std::stoull(key_str.substr(pos + 1));
+      } else {
+        uint64_t hash_value = std::hash<std::string>{}(key_str);
+        const uint64_t kMaxReasonableKey =
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 2;
+        return hash_value % (kMaxReasonableKey + 1);
+      }
+    }
+    const uint64_t kMaxReasonableKey =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 2;
+    return std::min(result, kMaxReasonableKey);
+  } catch (...) {
+    uint64_t hash_value = std::hash<std::string>{}(key_str);
+    const uint64_t kMaxReasonableKey =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 2;
+    return hash_value % (kMaxReasonableKey + 1);
+  }
+}
+
+std::string NumericToKeyBigEndian(uint64_t val) {
+  std::string result(8, '\0');
+  for (int i = 0; i < 8; ++i) {
+    result[static_cast<size_t>(i)] =
+        static_cast<char>((val >> (56 - 8 * i)) & 0xFF);
+  }
+  return result;
+}
+
+std::string EstimateFileLargestKey(const Slice& range_start,
+                                   const Slice& range_end,
+                                   int estimated_output_files,
+                                   int current_file_index) {
+  // Only support 8-byte binary keys for reversible conversion
+  if (range_start.size() != sizeof(uint64_t) ||
+      range_end.size() != sizeof(uint64_t)) {
+    return "";
+  }
+  int N = std::max(1, estimated_output_files);
+  uint64_t start_val = KeyToNumeric(range_start);
+  uint64_t end_val = KeyToNumeric(range_end);
+  if (end_val <= start_val) {
+    return range_end.ToString();
+  }
+  uint64_t range_size = end_val - start_val;
+  uint64_t segment = range_size / static_cast<uint64_t>(N);
+  int i = std::max(0, current_file_index);
+  if (i >= N) {
+    return range_end.ToString();
+  }
+  uint64_t upper_val = start_val + static_cast<uint64_t>(i + 1) * segment;
+  return NumericToKeyBigEndian(upper_val);
+}
 
 // Calculate ML features using safe value types (mimicking RocksDB native approach)
 // Instead of passing FileMetaData* pointer, we pass individual fields as value types
@@ -1139,22 +897,17 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   // Get cumulative_file_count from InternalStats (global counter, thread-safe, never reset)
   // This tracks all files ever created in the current level, including deleted ones
   InternalStats* internal_stats = cfd->internal_stats();
-  uint64_t current_level_cumulative_file_count = current_file_count;  // Default fallback
+  uint64_t current_level_cumulative_file_count = 0;
   if (internal_stats != nullptr) {
     // TODO: GetCumulativeFileCount method not yet implemented in InternalStats
     // current_level_cumulative_file_count = internal_stats->GetCumulativeFileCount(level);
     current_level_cumulative_file_count = static_cast<uint64_t>(current_file_count);
-    // Ensure cumulative >= current (should always be true, but handle edge cases)
-    if (current_level_cumulative_file_count < static_cast<uint64_t>(current_file_count)) {
-      // This indicates files were created before the counter was added
-      // Use current_file_count as a minimum (but log for debugging)
-      if (info_log) {
-        ROCKS_LOG_DEBUG(info_log,
+    if (current_level_cumulative_file_count < static_cast<uint64_t>(current_file_count) &&
+        info_log) {
+      ROCKS_LOG_WARN(info_log,
                        "[ML Features] cumulative_file_count (%" PRIu64 ") < current_file_count (%d) for level %d. "
-                       "Using current_file_count as minimum. file_number=%" PRIu64,
+                     "file_number=%" PRIu64,
                        current_level_cumulative_file_count, current_file_count, level, file_number);
-      }
-      current_level_cumulative_file_count = static_cast<uint64_t>(current_file_count);
     }
   }
   // Note: cumulative_file_count for current level is stored in levelX_cumulative_file_count
@@ -1205,7 +958,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     features->level_avg_score = sum_scores / file_scores.size();
   }
 
-  // Get file counts and total sizes for all levels (17-30)
+  // Get file counts and total sizes for all levels (0-6)
   // Use NumLevelFiles() which is safer than accessing LevelFiles().size()
   for (int l = 0; l < 7 && l < vstorage->num_levels(); l++) {
     int count = 0;
@@ -1214,10 +967,10 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       // Use NumLevelFiles() to safely get file count
       count = vstorage->NumLevelFiles(l);
       
-      // Calculate total size for this level (Level 1-6 only, Level 0 uses file count as trigger)
+      // Calculate total size for this level
       // Use NumLevelBytes() directly from RocksDB's data structure instead of manually iterating
       // This ensures we include all files (including trivial move files) and is more efficient
-      if (l > 0 && count > 0) {
+      if (count > 0) {
         try {
           total_size = vstorage->NumLevelBytes(l);
         } catch (...) {
@@ -1238,10 +991,13 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       }
       // Continue with count = 0, total_size = 0
     }
+    // Consistency: 0 files must imply 0 bytes
+    if (count == 0) {
+      total_size = 0;
+    }
     switch (l) {
       case 0:
         features->level0_current_file_count = count;
-        // Level 0 uses file count as trigger, not total size
         break;
       case 1:
         features->level1_current_file_count = count;
@@ -1270,125 +1026,61 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     }
   }
 
-  // Get cumulative compaction count and cumulative file count from InternalStats
-  // RocksDB maintains compaction statistics per level in InternalStats
-  // Note: internal_stats was already retrieved above, reuse it here
-  if (internal_stats != nullptr) {
-    // Get compaction stats for all levels
-    // Note: TEST_GetCompactionStats() is the only way to access comp_stats_,
-    // despite the TEST_ prefix, it's the standard way to access these stats
-    const std::vector<InternalStats::CompactionStats>& comp_stats = internal_stats->TEST_GetCompactionStats();
-    
-    // Set compaction count and cumulative file count for each level (0-6)
-    // Use the global cumulative file counter (never reset, tracks all files ever created)
+  // Get cumulative compaction count and file count from RocksDB InternalStats
+  // (comp_stats_[level].count, num_output_files, num_trivial_move_files)
+  {
+    const std::vector<InternalStats::CompactionStats>* comp_stats_ptr =
+        (internal_stats != nullptr) ? &internal_stats->TEST_GetCompactionStats()
+                                   : nullptr;
     for (int l = 0; l < 7; l++) {
-      int compaction_count = 0;
-      if (l < static_cast<int>(comp_stats.size())) {
-        compaction_count = comp_stats[l].count;
+      uint64_t compaction_count = 0;
+      uint64_t cumulative_file_count = 0;
+      uint64_t cumulative_trivial_move_count = 0;
+      if (comp_stats_ptr != nullptr &&
+          l < static_cast<int>(comp_stats_ptr->size())) {
+        compaction_count = static_cast<uint64_t>((*comp_stats_ptr)[l].count);
+        cumulative_file_count =
+            static_cast<uint64_t>((*comp_stats_ptr)[l].num_output_files);
+        cumulative_trivial_move_count =
+            static_cast<uint64_t>((*comp_stats_ptr)[l].num_trivial_move_files);
       }
-      
-      // Get cumulative file count from the global counter (thread-safe, never reset)
-      // This tracks all files ever created in each level, regardless of how they were created
-      // TODO: GetCumulativeFileCount method not yet implemented in InternalStats
-      uint64_t cumulative_file_count = 0;  // internal_stats->GetCumulativeFileCount(l);
-      
-      // Get cumulative trivial move count from the global counter (thread-safe, never reset)
-      // This tracks all files ever trivial moved to each level
-      // TODO: GetCumulativeTrivialMoveCount method not yet implemented in InternalStats
-      uint64_t cumulative_trivial_move_count = 0;  // internal_stats->GetCumulativeTrivialMoveCount(l);
-      
-      // Get current file count for this level to ensure cumulative >= current
-      int level_current_count = 0;
-      switch (l) {
-        case 0: level_current_count = features->level0_current_file_count; break;
-        case 1: level_current_count = features->level1_current_file_count; break;
-        case 2: level_current_count = features->level2_current_file_count; break;
-        case 3: level_current_count = features->level3_current_file_count; break;
-        case 4: level_current_count = features->level4_current_file_count; break;
-        case 5: level_current_count = features->level5_current_file_count; break;
-        case 6: level_current_count = features->level6_current_file_count; break;
-      }
-      
-      // Debug: log if cumulative_file_count is less than current_file_count
-      // This indicates files were created before the counter was added
-      // We don't modify the counter, just log for debugging
-      // Use WARN level so it's more visible (only log once per level to avoid spam)
-      if (cumulative_file_count < static_cast<uint64_t>(level_current_count) && info_log) {
-        static thread_local std::set<int> logged_levels;
-        if (logged_levels.find(l) == logged_levels.end()) {
-          logged_levels.insert(l);
-          ROCKS_LOG_WARN(info_log,
-                        "[ML Features] cumulative_file_count (%" PRIu64 ") < current_file_count (%d) for level %d. "
-                        "This indicates %d files were created before the counter was added (or counter is not being incremented). "
-                        "This is normal if the database was created before the counter was added. file_number=%" PRIu64,
-                        cumulative_file_count, level_current_count, l,
-                        level_current_count - static_cast<int>(cumulative_file_count), file_number);
-        }
-      }
-      
       switch (l) {
         case 0:
           features->level0_cumulative_compaction_count = compaction_count;
-          features->level0_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          // Level 0 does not have trivial moves
+          features->level0_cumulative_file_count = cumulative_file_count;
           break;
         case 1:
           features->level1_cumulative_compaction_count = compaction_count;
-          features->level1_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level1_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level1_cumulative_file_count = cumulative_file_count;
+          features->level1_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 2:
           features->level2_cumulative_compaction_count = compaction_count;
-          features->level2_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level2_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level2_cumulative_file_count = cumulative_file_count;
+          features->level2_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 3:
           features->level3_cumulative_compaction_count = compaction_count;
-          features->level3_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level3_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level3_cumulative_file_count = cumulative_file_count;
+          features->level3_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 4:
           features->level4_cumulative_compaction_count = compaction_count;
-          features->level4_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level4_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level4_cumulative_file_count = cumulative_file_count;
+          features->level4_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 5:
           features->level5_cumulative_compaction_count = compaction_count;
-          features->level5_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level5_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level5_cumulative_file_count = cumulative_file_count;
+          features->level5_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 6:
           features->level6_cumulative_compaction_count = compaction_count;
-          features->level6_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level6_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level6_cumulative_file_count = cumulative_file_count;
+          features->level6_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
       }
     }
-  } else {
-    // If internal_stats is null, set cumulative counts to current counts
-    // This should be rare, but handle gracefully
-    if (info_log) {
-      ROCKS_LOG_WARN(info_log,
-                     "[ML Features] internal_stats is null, cannot get compaction/file counts: "
-                     "file_number=%" PRIu64 ", level=%d",
-                     file_number, level);
-    }
-    // Fallback: set cumulative to current (not accurate, but better than 0)
-    features->level0_cumulative_file_count = features->level0_current_file_count;
-    features->level1_cumulative_file_count = features->level1_current_file_count;
-    features->level2_cumulative_file_count = features->level2_current_file_count;
-    features->level3_cumulative_file_count = features->level3_current_file_count;
-    features->level4_cumulative_file_count = features->level4_current_file_count;
-    features->level5_cumulative_file_count = features->level5_current_file_count;
-    features->level6_cumulative_file_count = features->level6_current_file_count;
-    // Trivial move counts default to 0 if internal_stats is null
-    // Level 0 does not have trivial moves
-    features->level1_cumulative_trivial_move_count = 0;
-    features->level2_cumulative_trivial_move_count = 0;
-    features->level3_cumulative_trivial_move_count = 0;
-    features->level4_cumulative_trivial_move_count = 0;
-    features->level5_cumulative_trivial_move_count = 0;
-    features->level6_cumulative_trivial_move_count = 0;
   }
 
   // ========== Key Space Features (38-55) ==========
@@ -1431,28 +1123,23 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       if (largest_numeric >= smallest_numeric) {
         features->key_range_size = largest_numeric - smallest_numeric + 1;
       } else {
-        // Handle wrap-around case (shouldn't happen normally)
-        features->key_range_size = 1;
+        features->key_range_size = 0;  // Invalid: largest < smallest
       }
     } catch (...) {
-      // If hex parsing fails, try using KeyToNumeric as fallback
       features->key_range_start = KeyToNumeric(file_smallest);
       features->key_range_end = KeyToNumeric(file_largest);
-      // Fallback to num_entries for key_range_size
-      features->key_range_size = num_entries > 0 ? num_entries : 1;
+      features->key_range_size = 0;  // Invalid: hex parse failed
     }
   } else {
     features->key_range = "N/A";
-    // Fallback to num_entries if keys are invalid
-    // Try to get numeric values from keys even if they're invalid
     features->key_range_start = KeyToNumeric(file_smallest);
     features->key_range_end = KeyToNumeric(file_largest);
-    features->key_range_size = num_entries > 0 ? num_entries : 1;
+    features->key_range_size = 0;  // Invalid: keys unset
   }
   features->log10_key_range_size =
       features->key_range_size > 0
           ? std::log10(static_cast<double>(features->key_range_size))
-          : 0.0;
+          : std::numeric_limits<double>::quiet_NaN();
 
   // Calculate overlap_with_lower
   // Use GetOverlappingInputs exactly as RocksDB does in compaction picker
@@ -1659,53 +1346,34 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       features->overlap_ratio_with_lower = 0.0;
     }
   } else {
-    // If key_range_size is 0, set ratio to 0
-    features->overlap_ratio_with_lower = 0.0;
-    // Log warning if we have overlaps but key_range_size is 0
-    if (features->overlap_with_lower > 0) {
+    // key_range_size is 0: invalid, use NaN to expose error
+    features->overlap_ratio_with_lower = std::numeric_limits<double>::quiet_NaN();
+    features->overlap_ratio_with_upper = std::numeric_limits<double>::quiet_NaN();
+    if (features->overlap_with_lower > 0 || features->overlap_with_upper > 0) {
       ROCKS_LOG_WARN(info_log,
                      "[ML Features] key_range_size is 0 but overlaps exist: "
-                     "overlap_with_lower=%" PRIu64
+                     "overlap_with_lower=%" PRIu64 " overlap_with_upper=%" PRIu64
                      ", file_number=%" PRIu64 ", level=%d",
-                     features->overlap_with_lower,
+                     features->overlap_with_lower, features->overlap_with_upper,
                      file_number, level);
     }
   }
 
-  // Calculate key_range_position_in_level
-  // Optimization: Count files with smaller keys instead of full sort
+  // Calculate key_range_position_in_level and key_range_percentile_in_level
   int position = 0;
   for (const auto* f : level_files) {
-    // Safety check: report error for null or invalid file pointers
-    if (f == nullptr) {
-      ROCKS_LOG_ERROR(info_log,
-                      "[ML Features] Invalid null pointer in level_files "
-                      "key_range_position calculation at level %d, target_file_number=%" PRIu64,
-                      level, file_number);
-      continue;
-    }
-    // Extract fields to local variables (mimicking RocksDB native approach)
-    FileDescriptor f_fd = f->fd;  // Copy FileDescriptor (value type)
-    InternalKey f_smallest_key = f->smallest;
-    
-    if (f_smallest_key.unset()) {
-      ROCKS_LOG_ERROR(info_log,
-                        "[ML Features] Invalid file with unset smallest key in "
-                        "level_files key_range_position calculation at level %d, "
-                        "file_number=%" PRIu64 ", target_file_number=%" PRIu64,
-                        level, f_fd.GetNumber(), file_number);
-      continue;
-    }
-    if (icmp->Compare(f_smallest_key, file_smallest) < 0) {
+    if (f == nullptr) continue;
+    // Compare using smallest key
+    if (icmp->Compare(f->smallest, file_smallest) < 0) {
       position++;
     }
   }
-  features->key_range_position_in_level = position;
-  if (current_file_count > 0) {
-    features->key_range_percentile_in_level =
-        (static_cast<double>(features->key_range_position_in_level) /
-         current_file_count) *
-        100.0;
+  features->key_range_position_in_level = static_cast<double>(position);
+  if (current_file_count > 1) {
+    features->key_range_percentile_in_level = 
+        static_cast<double>(position) / static_cast<double>(current_file_count - 1);
+  } else {
+    features->key_range_percentile_in_level = 0.0;
   }
 
   // Calculate neighbor distances
@@ -1848,10 +1516,8 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
         current_file_count;
   }
 
-  // neighbor_files_count
-  // Optimization: Use already calculated neighbor distances and limit checks
-  // Files are neighbors if key distance <= 1
-  // -1 indicates no neighbor, so we skip it
+  // neighbor_files_count - count files that are close neighbors
+  features->neighbor_files_count = 0;
   if (features->left_neighbor_key_distance >= 0.0 &&
       features->left_neighbor_key_distance <= 1.0) {
     features->neighbor_files_count++;
@@ -1860,134 +1526,43 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       features->right_neighbor_key_distance <= 1.0) {
     features->neighbor_files_count++;
   }
-  // Also check other files in level (but limit to avoid slowdown)
-  const size_t max_neighbor_check = 50;
-  size_t neighbor_checks = 0;
-  for (const auto* other_file : level_files) {
-    if (neighbor_checks >= max_neighbor_check) {
-      break;
-    }
-    // Safety check: report error for null or invalid file pointers
-    if (other_file == nullptr) {
-      ROCKS_LOG_ERROR(info_log,
-                      "[ML Features] Invalid null pointer in level_files "
-                      "neighbor_files_count calculation at level %d, target_file_number=%" PRIu64,
-                      level, file_number);
-      continue;
-    }
-    // Extract fields to local variables (mimicking RocksDB native approach)
-    InternalKey other_smallest = other_file->smallest;
-    InternalKey other_largest = other_file->largest;
-    FileDescriptor other_fd = other_file->fd;  // Copy for logging
-    
-    if (other_smallest.unset() || other_largest.unset()) {
-      ROCKS_LOG_ERROR(info_log,
-                      "[ML Features] Invalid file with unset keys in "
-                      "level_files neighbor_files_count calculation at level %d, "
-                      "file_number=%" PRIu64 ", target_file_number=%" PRIu64,
-                      level, other_fd.GetNumber(), file_number);
-      continue;
-    }
-    if (other_file == left_neighbor || other_file == right_neighbor) {
-      continue;  // Already checked
-    }
-    // Quick check: only check files that are close in key space
-    // Calculate distance without full overlap calculation
-    double distance = 0.0;
-    if (icmp->Compare(other_largest, file_smallest) < 0) {
-      // other_file is before current file
-      if (!file_smallest.unset() && !other_largest.unset()) {
-        uint64_t file_start = KeyToNumeric(file_smallest);
-        uint64_t other_end = KeyToNumeric(other_largest);
-        distance = static_cast<double>(file_start) - static_cast<double>(other_end);
-      }
-    } else if (icmp->Compare(other_smallest, file_largest) > 0) {
-      // other_file is after current file
-      if (!file_largest.unset() && !other_smallest.unset()) {
-        uint64_t other_start = KeyToNumeric(other_smallest);
-        uint64_t file_end = KeyToNumeric(file_largest);
-        distance = static_cast<double>(other_start) - static_cast<double>(file_end);
-      }
-    } else {
-      // Files overlap, distance is 0 or negative
-      distance = 0.0;
-    }
-    if (std::abs(distance) <= 1.0) {
-      features->neighbor_files_count++;
-      neighbor_checks++;
-    }
-  }
 
   // ========== Cross Level Features (60-61) ==========
   
-  // lower_level_capacity_ratio
-  // Use NumLevelBytes() directly from RocksDB's data structure instead of manually iterating
-  // This is more efficient and accurate than manually iterating files
+  // lower_level_capacity_ratio = lower_level_size / MaxBytesForLevel(lower_level)
   if (level < vstorage->num_levels() - 1) {
-    uint64_t lower_level_total_size = 0;
-    try {
-      lower_level_total_size = vstorage->NumLevelBytes(level + 1);
-    } catch (...) {
-      if (info_log) {
-        ROCKS_LOG_DEBUG(info_log,
-                        "[ML Features] Exception getting NumLevelBytes for lower level %d, file_number=%" PRIu64,
-                        level + 1, file_number);
-      }
-      // Fallback to 0 if NumLevelBytes fails
-      lower_level_total_size = 0;
-    }
-    uint64_t lower_level_capacity = vstorage->MaxBytesForLevel(level + 1);
-    if (lower_level_capacity > 0) {
-      features->lower_level_capacity_ratio =
-          static_cast<double>(lower_level_total_size) / lower_level_capacity;
+    int lower_level = level + 1;
+    uint64_t lower_level_size = vstorage->NumLevelBytes(lower_level);
+    uint64_t lower_level_max = vstorage->MaxBytesForLevel(lower_level);
+    if (lower_level_max > 0) {
+      features->lower_level_capacity_ratio = 
+          static_cast<double>(lower_level_size) / static_cast<double>(lower_level_max);
     }
   }
   
-  // upper_level_capacity_ratio
-  // Use NumLevelBytes() directly from RocksDB's data structure instead of manually iterating
-  // This is more efficient and accurate than manually iterating files
+  // upper_level_capacity_ratio = upper_level_size / MaxBytesForLevel(upper_level)
   if (level > 0) {
-    uint64_t upper_level_total_size = 0;
-    try {
-      upper_level_total_size = vstorage->NumLevelBytes(level - 1);
-    } catch (...) {
-      if (info_log) {
-        ROCKS_LOG_DEBUG(info_log,
-                        "[ML Features] Exception getting NumLevelBytes for upper level %d, file_number=%" PRIu64,
-                        level - 1, file_number);
-      }
-      // Fallback to 0 if NumLevelBytes fails
-      upper_level_total_size = 0;
-    }
-    
-    uint64_t upper_level_capacity = vstorage->MaxBytesForLevel(level - 1);
-    if (upper_level_capacity > 0) {
-      features->upper_level_capacity_ratio =
-          static_cast<double>(upper_level_total_size) / upper_level_capacity;
+    int upper_level = level - 1;
+    uint64_t upper_level_size = vstorage->NumLevelBytes(upper_level);
+    uint64_t upper_level_max = vstorage->MaxBytesForLevel(upper_level);
+    if (upper_level_max > 0) {
+      features->upper_level_capacity_ratio = 
+          static_cast<double>(upper_level_size) / static_cast<double>(upper_level_max);
     }
   }
 
-  // ========== Composite Scores (62-64) ==========
+  // ========== Composite Scores ==========
   
-  // urgency_score = file_count_ratio × (1 / active_rank_normalized)
+  // urgency_score = file_count_ratio * (1 / active_rank_normalized)
   if (features->active_rank_normalized > 0) {
-    features->urgency_score =
-        features->file_count_ratio / features->active_rank_normalized;
+    features->urgency_score = features->file_count_ratio / features->active_rank_normalized;
   }
 
   // health_score = 1 / (1 + level_avg_score)
   features->health_score = 1.0 / (1.0 + features->level_avg_score);
-
-  // stability_score = active_rank_normalized × (first_active_score / max_score) × health_score
-  double max_score = 0.0;
-  for (const auto& info : file_scores) {
-    max_score = std::max(max_score, info.active_score);
-  }
-  double score_normalized = max_score > 0
-                                ? features->first_active_score / max_score
-                                : 0.0;
-  features->stability_score = features->active_rank_normalized *
-                             score_normalized * features->health_score;
+  
+  // stability_score = 1 / (1 + overlap_ratio_with_lower + overlap_ratio_with_upper)
+  features->stability_score = 1.0 / (1.0 + features->overlap_ratio_with_lower + features->overlap_ratio_with_upper);
 
   // Calculation complete, version_guard will release the reference in its destructor
   // Mutex will be released when lock goes out of scope
@@ -2005,93 +1580,57 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
 void WriteMLFeaturesToJSON(const MLFeatures& features, JSONWriter* jwriter) {
   jwriter->StartObject();
 
-  // Score and Rank (1-9)
-  *jwriter << "first_active_score" << features.first_active_score
-          << "first_active_rank" << features.first_active_rank
-          << "active_rank_normalized" << features.active_rank_normalized
-          << "first_passive_score" << features.first_passive_score
+  // Rank/Score features (8 features)
+  *jwriter << "first_active_rank" << features.first_active_rank
           << "first_passive_rank" << features.first_passive_rank
+          << "active_rank_normalized" << features.active_rank_normalized
           << "passive_rank_normalized" << features.passive_rank_normalized
-          << "score_rank_interaction" << features.score_rank_interaction
-          << "rank_difference" << features.rank_difference
-          << "score_difference" << features.score_difference;
-
-  // Level State (10-37)
-  *jwriter << "file_count_ratio" << features.file_count_ratio
+          << "first_active_score" << features.first_active_score
+          << "first_passive_score" << features.first_passive_score
           << "level_avg_score" << features.level_avg_score
-          << "level0_current_file_count" << features.level0_current_file_count
-          << "level0_cumulative_file_count" << features.level0_cumulative_file_count
-          << "level1_current_file_count" << features.level1_current_file_count
-          << "level1_cumulative_file_count" << features.level1_cumulative_file_count
-          << "level2_current_file_count" << features.level2_current_file_count
-          << "level2_cumulative_file_count" << features.level2_cumulative_file_count
-          << "level3_current_file_count" << features.level3_current_file_count
-          << "level3_cumulative_file_count" << features.level3_cumulative_file_count
-          << "level4_current_file_count" << features.level4_current_file_count
-          << "level4_cumulative_file_count" << features.level4_cumulative_file_count
-          << "level5_current_file_count" << features.level5_current_file_count
-          << "level5_cumulative_file_count" << features.level5_cumulative_file_count
-          << "level6_current_file_count" << features.level6_current_file_count
-          << "level6_cumulative_file_count" << features.level6_cumulative_file_count
-          << "level1_total_size" << static_cast<int64_t>(features.level1_total_size)
-          << "level2_total_size" << static_cast<int64_t>(features.level2_total_size)
-          << "level3_total_size" << static_cast<int64_t>(features.level3_total_size)
-          << "level4_total_size" << static_cast<int64_t>(features.level4_total_size)
-          << "level5_total_size" << static_cast<int64_t>(features.level5_total_size)
-          << "level6_total_size" << static_cast<int64_t>(features.level6_total_size)
-          << "level0_cumulative_compaction_count" << features.level0_cumulative_compaction_count
-          << "level1_cumulative_compaction_count" << features.level1_cumulative_compaction_count
-          << "level2_cumulative_compaction_count" << features.level2_cumulative_compaction_count
-          << "level3_cumulative_compaction_count" << features.level3_cumulative_compaction_count
-          << "level4_cumulative_compaction_count" << features.level4_cumulative_compaction_count
-          << "level5_cumulative_compaction_count" << features.level5_cumulative_compaction_count
-          << "level6_cumulative_compaction_count" << features.level6_cumulative_compaction_count
-          << "level1_cumulative_trivial_move_count" << features.level1_cumulative_trivial_move_count
-          << "level2_cumulative_trivial_move_count" << features.level2_cumulative_trivial_move_count
-          << "level3_cumulative_trivial_move_count" << features.level3_cumulative_trivial_move_count
-          << "level4_cumulative_trivial_move_count" << features.level4_cumulative_trivial_move_count
-          << "level5_cumulative_trivial_move_count" << features.level5_cumulative_trivial_move_count
-          << "level6_cumulative_trivial_move_count" << features.level6_cumulative_trivial_move_count;
+          << "score_rank_interaction" << features.score_rank_interaction;
 
-  // Key Space (38-55) - file_size related features removed
+  // Key Range features (4 features)
   *jwriter << "key_range" << features.key_range
           << "key_range_start" << static_cast<int64_t>(features.key_range_start)
           << "key_range_end" << static_cast<int64_t>(features.key_range_end)
           << "key_range_size" << static_cast<int64_t>(features.key_range_size)
-          << "log10_key_range_size" << features.log10_key_range_size
-          << "overlap_with_lower" << static_cast<int64_t>(features.overlap_with_lower)
+          << "log10_key_range_size" << features.log10_key_range_size;
+
+  // Level Stats features (9 features)
+  *jwriter << "level0_cumulative_compaction_count" << features.level0_cumulative_compaction_count
+          << "level1_cumulative_compaction_count" << features.level1_cumulative_compaction_count
+          << "level2_cumulative_compaction_count" << features.level2_cumulative_compaction_count
+          << "level2_total_size" << static_cast<int64_t>(features.level2_total_size)
+          << "level4_current_file_count" << features.level4_current_file_count
+          << "level4_cumulative_compaction_count" << features.level4_cumulative_compaction_count
+          << "level5_current_file_count" << features.level5_current_file_count
+          << "level5_cumulative_compaction_count" << features.level5_cumulative_compaction_count
+          << "level5_total_size" << static_cast<int64_t>(features.level5_total_size);
+
+  // Overlap features (6 features)
+  *jwriter << "overlap_with_lower" << static_cast<int64_t>(features.overlap_with_lower)
           << "overlap_with_upper" << static_cast<int64_t>(features.overlap_with_upper)
-          // Note: file_size, log10_file_size, file_size_ratio, file_density, log10_file_density removed
           << "overlap_count_with_lower" << features.overlap_count_with_lower
-          << "overlap_ratio_with_lower" << features.overlap_ratio_with_lower
           << "overlap_count_with_upper" << features.overlap_count_with_upper
-          << "overlap_ratio_with_upper" << features.overlap_ratio_with_upper
-          << "key_range_position_in_level" << features.key_range_position_in_level
-          << "key_range_percentile_in_level" << features.key_range_percentile_in_level;
+          << "overlap_ratio_with_lower" << features.overlap_ratio_with_lower
+          << "overlap_ratio_with_upper" << features.overlap_ratio_with_upper;
   
-  // Write neighbor distances, handling inf values (no neighbors)
-  // JSON doesn't support inf, so we use string "inf" to represent it
+  // Neighbor features (4 features)
   WriteDoubleOrInf(jwriter, "left_neighbor_key_distance", features.left_neighbor_key_distance);
   WriteDoubleOrInf(jwriter, "right_neighbor_key_distance", features.right_neighbor_key_distance);
   WriteDoubleOrInf(jwriter, "min_neighbor_key_distance", features.min_neighbor_key_distance);
   WriteDoubleOrInf(jwriter, "avg_neighbor_key_distance", features.avg_neighbor_key_distance);
 
-  // Competition (56-59)
-  *jwriter << "competition_ratio" << features.competition_ratio
-          << "better_score_files_count" << features.better_score_files_count
+  // Competition features (3 features)
+  *jwriter << "better_score_files_count" << features.better_score_files_count
           << "worse_score_files_count" << features.worse_score_files_count
-          << "neighbor_files_count" << features.neighbor_files_count;
+          << "competition_ratio" << features.competition_ratio;
 
-  // Cross Level (60-61)
-  *jwriter << "lower_level_capacity_ratio" << features.lower_level_capacity_ratio
-          << "upper_level_capacity_ratio" << features.upper_level_capacity_ratio;
+  // Other features (1 feature)
+  *jwriter << "urgency_score" << features.urgency_score;
 
-  // Composite Scores (62-64)
-  *jwriter << "urgency_score" << features.urgency_score
-          << "health_score" << features.health_score
-          << "stability_score" << features.stability_score;
-
-  // Creation Level (69)
+  // Creation Level (for logging only)
   *jwriter << "creation_level" << features.creation_level;
 
   jwriter->EndObject();
@@ -2100,13 +1639,33 @@ void WriteMLFeaturesToJSON(const MLFeatures& features, JSONWriter* jwriter) {
 // Calculate ML features before file write (file_size not available)
 // This function reuses the complete logic from CalculateMLFeatures but removes
 // file_size related features (file_size, log10_file_size, file_size_ratio, file_density, log10_file_density)
+static inline bool SubsetHasAnyInRange(const std::vector<int>* subset, int lo, int hi) {
+  if (subset == nullptr || subset->empty()) return true;
+  for (int i : *subset) {
+    if (i >= lo && i <= hi) return true;
+  }
+  return false;
+}
+
 bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                                     const InternalKey& largest,
-                                    uint64_t num_entries, int level,
+                                    uint64_t num_entries,
+                                    uint64_t estimated_file_size,
+                                    int level,
                                     ColumnFamilyData* cfd,
                                     MLFeatures* features,
-                                    InstrumentedMutex* db_mutex) {
+                                    InstrumentedMutex* db_mutex,
+                                    const std::vector<int>* subset_indices) {
   Logger* info_log = cfd ? cfd->ioptions().info_log.get() : nullptr;
+  const bool need_rank = SubsetHasAnyInRange(subset_indices, 0, 10);
+  const bool need_key = SubsetHasAnyInRange(subset_indices, 11, 16);
+  const bool need_level = SubsetHasAnyInRange(subset_indices, 17, 49);
+  const bool need_overlap = SubsetHasAnyInRange(subset_indices, 50, 55);
+  const bool need_neighbor = SubsetHasAnyInRange(subset_indices, 56, 59);
+  const bool need_competition = SubsetHasAnyInRange(subset_indices, 60, 63);
+  const bool need_other = SubsetHasAnyInRange(subset_indices, 64, 68);
+  const bool need_key_effective = need_key || need_overlap;
+  const bool need_rank_effective = need_rank || need_competition;
   
   // Validate parameters
   if (cfd == nullptr || features == nullptr) {
@@ -2133,21 +1692,9 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   InternalKey file_smallest = smallest;
   InternalKey file_largest = largest;
 
-  // For level 0, skip ML features calculation entirely
+  // Level 0: skip ML features (fixed to handle 6). Level 1–5: compute features for prediction.
   if (level == 0) {
     return false;
-  } else if (level == 1) {
-    ROCKS_LOG_INFO(info_log, "[ML Features] Skipping: level=1");
-  } else if (level == 2) {
-    ROCKS_LOG_INFO(info_log, "[ML Features] Skipping: level=2");
-  } else if (level == 3) {
-    ROCKS_LOG_INFO(info_log, "[ML Features] Skipping: level=3");
-  } else if (level == 4) {
-    ROCKS_LOG_INFO(info_log, "[ML Features] Skipping: level=4");
-  } else if (level == 5) {
-    ROCKS_LOG_INFO(info_log, "[ML Features] Skipping: level=5");
-  } else if (level == 6) {
-    ROCKS_LOG_INFO(info_log, "[ML Features] Skipping: level=6");
   }
 
   // Initialize all features to 0
@@ -2229,12 +1776,18 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     return false;
   }
 
-  // Estimate compensated_file_size based on num_entries
-  // Use average entry size estimation (this is approximate)
-  // Typical SST file: ~100 bytes per entry (key + value + overhead)
-  uint64_t estimated_compensated_file_size = num_entries * 100;
-  if (estimated_compensated_file_size == 0) {
-    estimated_compensated_file_size = 1; // Avoid division by zero
+  // Estimate compensated_file_size
+  // Priority: 1) Use estimated_file_size if provided (e.g., target_file_size)
+  //           2) Fall back to num_entries * 100 if estimated_file_size is 0
+  //           3) Use a reasonable default (16MB) if both are 0
+  uint64_t estimated_compensated_file_size;
+  if (estimated_file_size > 0) {
+    estimated_compensated_file_size = estimated_file_size;
+  } else if (num_entries > 0) {
+    estimated_compensated_file_size = num_entries * 100;
+  } else {
+    // Default to 16MB (typical SST file size)
+    estimated_compensated_file_size = 16 * 1024 * 1024;
   }
   
   // Validation LOG: Input parameters
@@ -2243,9 +1796,9 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     Slice largest_user_key = ExtractUserKey(file_largest.Encode());
     ROCKS_LOG_INFO(info_log,
                    "[ML Features Validation] Input: level=%d num_entries=%" PRIu64
-                   " estimated_compensated_file_size=%" PRIu64
+                   " estimated_file_size=%" PRIu64 " estimated_compensated_file_size=%" PRIu64
                    " smallest_key_len=%zu largest_key_len=%zu",
-                   level, num_entries, estimated_compensated_file_size,
+                   level, num_entries, estimated_file_size, estimated_compensated_file_size,
                    smallest_user_key.size(), largest_user_key.size());
   }
 
@@ -2323,9 +1876,21 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     return false;
   }
   files_with_current.push_back(&temp_file);
-
-  // ========== Score and Rank Features (1-9) ==========
   
+  // 预先计算 current_file_count（在条件块外使用）
+  int current_file_count = vstorage->NumLevelFiles(level) + 1;
+  
+  struct FileScoreInfo {
+    const FileMetaData* file;
+    double active_score;
+    double passive_score;
+  };
+  std::vector<FileScoreInfo> file_scores;
+
+  if (need_rank_effective) {
+  // ========== Score and Rank Features (0-10) ==========
+  
+  // 所有 Level (1-5) 都计算 score/rank 特征
   // Calculate active_score using estimated file size
   double active_score_raw = CalculateFileScoreForMinOverlappingRatio(
       &file_smallest, &file_largest, 0, estimated_compensated_file_size, vstorage, level, icmp, ioptions,
@@ -2386,16 +1951,12 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   features->first_passive_score = static_cast<double>(passive_score_value);
 
   // Calculate scores for all files in level to determine rank
-  struct FileScoreInfo {
-    const FileMetaData* file;
-    double active_score;
-    double passive_score;
-  };
+  // FileScoreInfo 已在条件块外定义
   
   const size_t max_files_for_rank_calc = 1000;
   const size_t files_to_process = std::min(level_files.size(), max_files_for_rank_calc);
   
-  std::vector<FileScoreInfo> file_scores;
+  // file_scores 已在条件块外定义
   file_scores.reserve(files_to_process + 1);
 
   // Calculate scores for existing files
@@ -2561,10 +2122,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   features->first_passive_rank = passive_rank;
 
   // Calculate normalized ranks
-  // Use NumLevelFiles() directly from RocksDB's data structure instead of level_files.size()
-  // This ensures we include all files (including trivial move files) that are in vstorage
-  // +1 because the current file hasn't been added to vstorage yet
-  int current_file_count = vstorage->NumLevelFiles(level) + 1;
+  // current_file_count 已在条件块外定义
   if (current_file_count > 0) {
     features->active_rank_normalized =
         static_cast<double>(features->first_active_rank) / current_file_count;
@@ -2601,7 +2159,18 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   features->rank_difference = features->first_active_rank - features->first_passive_rank;
   features->score_difference = features->first_active_score - features->first_passive_score;
 
-  // ========== Level State Features (10-37) ==========
+  // Calculate level_avg_score (uses file_scores, must stay inside need_rank_effective scope)
+  double sum_scores = 0.0;
+  for (const auto& info : file_scores) {
+    sum_scores += info.active_score;
+  }
+  if (file_scores.size() > 0) {
+    features->level_avg_score = sum_scores / file_scores.size();
+  }
+
+  }  // need_rank_effective
+
+  // ========== Level State Features (file_count_ratio, level* 17-49) ==========
   
   // Get cumulative_file_count from InternalStats
   InternalStats* internal_stats = cfd->internal_stats();
@@ -2645,26 +2214,16 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     }
   }
 
-  // Calculate level_avg_score
-  double sum_scores = 0.0;
-  for (const auto& info : file_scores) {
-    sum_scores += info.active_score;
-  }
-  if (file_scores.size() > 0) {
-    features->level_avg_score = sum_scores / file_scores.size();
-  }
-
-  // Get file counts and total sizes for all levels (17-30)
+  if (need_level) {
+  // Get file counts and total sizes for all levels (0-6)
   for (int l = 0; l < 7 && l < vstorage->num_levels(); l++) {
     int count = 0;
     uint64_t total_size = 0;
     try {
       count = vstorage->NumLevelFiles(l);
       
-      // Calculate total size for this level (Level 1-6 only, Level 0 uses file count as trigger)
-      // Use NumLevelBytes() directly from RocksDB's data structure instead of manually iterating
-      // This ensures we include all files (including trivial move files) and is more efficient
-      if (l > 0 && count > 0) {
+      // Calculate total size for this level
+      if (count > 0) {
         try {
           total_size = vstorage->NumLevelBytes(l);
         } catch (...) {
@@ -2673,7 +2232,6 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                             "[ML Features] Exception getting NumLevelBytes at level %d",
                             l);
           }
-          // Fallback to 0 if NumLevelBytes fails
           total_size = 0;
         }
       }
@@ -2683,6 +2241,10 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                         "[ML Features] Exception getting NumLevelFiles at level %d",
                         l);
       }
+    }
+    // Consistency: 0 files must imply 0 bytes
+    if (count == 0) {
+      total_size = 0;
     }
     switch (l) {
       case 0:
@@ -2715,97 +2277,66 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     }
   }
 
-  // Get cumulative compaction count and cumulative file count from InternalStats
-  if (internal_stats != nullptr) {
-    const std::vector<InternalStats::CompactionStats>& comp_stats = internal_stats->TEST_GetCompactionStats();
-    
+  // Get cumulative compaction count and file count from RocksDB InternalStats
+  {
+    const std::vector<InternalStats::CompactionStats>* comp_stats_ptr =
+        (internal_stats != nullptr) ? &internal_stats->TEST_GetCompactionStats()
+                                   : nullptr;
     for (int l = 0; l < 7; l++) {
-      int compaction_count = 0;
-      if (l < static_cast<int>(comp_stats.size())) {
-        compaction_count = comp_stats[l].count;
+      uint64_t compaction_count = 0;
+      uint64_t cumulative_file_count = 0;
+      uint64_t cumulative_trivial_move_count = 0;
+      if (comp_stats_ptr != nullptr &&
+          l < static_cast<int>(comp_stats_ptr->size())) {
+        compaction_count = static_cast<uint64_t>((*comp_stats_ptr)[l].count);
+        cumulative_file_count =
+            static_cast<uint64_t>((*comp_stats_ptr)[l].num_output_files);
+        cumulative_trivial_move_count =
+            static_cast<uint64_t>((*comp_stats_ptr)[l].num_trivial_move_files);
       }
-      
-      // TODO: GetCumulativeFileCount/GetCumulativeTrivialMoveCount methods not yet implemented
-      uint64_t cumulative_file_count = 0;  // internal_stats->GetCumulativeFileCount(l);
-      uint64_t cumulative_trivial_move_count = 0;  // internal_stats->GetCumulativeTrivialMoveCount(l);
-      
-      int level_current_count = 0;
-      switch (l) {
-        case 0: level_current_count = features->level0_current_file_count; break;
-        case 1: level_current_count = features->level1_current_file_count; break;
-        case 2: level_current_count = features->level2_current_file_count; break;
-        case 3: level_current_count = features->level3_current_file_count; break;
-        case 4: level_current_count = features->level4_current_file_count; break;
-        case 5: level_current_count = features->level5_current_file_count; break;
-        case 6: level_current_count = features->level6_current_file_count; break;
-      }
-      
-      // Validation LOG: Cumulative vs current file count consistency
-      if (info_log && l == level) {
-        if (cumulative_file_count < static_cast<uint64_t>(level_current_count)) {
-          ROCKS_LOG_WARN(info_log,
-                         "[ML Features Validation] Cumulative file count < current at level=%d:"
-                         " cumulative=%" PRIu64 " current=%d (expected cumulative >= current)",
-                         l, cumulative_file_count, level_current_count);
-        }
-      }
-      
       switch (l) {
         case 0:
           features->level0_cumulative_compaction_count = compaction_count;
-          features->level0_cumulative_file_count = static_cast<int>(cumulative_file_count);
+          features->level0_cumulative_file_count = cumulative_file_count;
           break;
         case 1:
           features->level1_cumulative_compaction_count = compaction_count;
-          features->level1_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level1_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level1_cumulative_file_count = cumulative_file_count;
+          features->level1_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 2:
           features->level2_cumulative_compaction_count = compaction_count;
-          features->level2_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level2_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level2_cumulative_file_count = cumulative_file_count;
+          features->level2_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 3:
           features->level3_cumulative_compaction_count = compaction_count;
-          features->level3_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level3_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level3_cumulative_file_count = cumulative_file_count;
+          features->level3_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 4:
           features->level4_cumulative_compaction_count = compaction_count;
-          features->level4_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level4_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level4_cumulative_file_count = cumulative_file_count;
+          features->level4_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 5:
           features->level5_cumulative_compaction_count = compaction_count;
-          features->level5_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level5_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level5_cumulative_file_count = cumulative_file_count;
+          features->level5_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
         case 6:
           features->level6_cumulative_compaction_count = compaction_count;
-          features->level6_cumulative_file_count = static_cast<int>(cumulative_file_count);
-          features->level6_cumulative_trivial_move_count = static_cast<int>(cumulative_trivial_move_count);
+          features->level6_cumulative_file_count = cumulative_file_count;
+          features->level6_cumulative_trivial_move_count = cumulative_trivial_move_count;
           break;
       }
     }
-  } else {
-    // Fallback: set cumulative to current
-    features->level0_cumulative_file_count = features->level0_current_file_count;
-    features->level1_cumulative_file_count = features->level1_current_file_count;
-    features->level2_cumulative_file_count = features->level2_current_file_count;
-    features->level3_cumulative_file_count = features->level3_current_file_count;
-    features->level4_cumulative_file_count = features->level4_current_file_count;
-    features->level5_cumulative_file_count = features->level5_current_file_count;
-    features->level6_cumulative_file_count = features->level6_current_file_count;
-    features->level1_cumulative_trivial_move_count = 0;
-    features->level2_cumulative_trivial_move_count = 0;
-    features->level3_cumulative_trivial_move_count = 0;
-    features->level4_cumulative_trivial_move_count = 0;
-    features->level5_cumulative_trivial_move_count = 0;
-    features->level6_cumulative_trivial_move_count = 0;
   }
+  }  // need_level
 
-  // ========== Key Space Features (38-55) ==========
+  // ========== Key Space Features (11-16 key, 50-55 overlap) ==========
   
+  if (need_key_effective) {
   // key_range: Format key range in hex format
   auto SliceToHex = [](const Slice& s) -> std::string {
     std::ostringstream oss;
@@ -2840,25 +2371,23 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
       if (largest_numeric >= smallest_numeric) {
         features->key_range_size = largest_numeric - smallest_numeric + 1;
       } else {
-        features->key_range_size = 1;
+        features->key_range_size = 0;  // Invalid: largest < smallest
       }
     } catch (...) {
-      // If hex parsing fails, try using KeyToNumeric as fallback
       features->key_range_start = KeyToNumeric(file_smallest);
       features->key_range_end = KeyToNumeric(file_largest);
-      features->key_range_size = num_entries > 0 ? num_entries : 1;
+      features->key_range_size = 0;  // Invalid: hex parse failed
     }
   } else {
     features->key_range = "N/A";
-    // Try to get numeric values from keys even if they're invalid
     features->key_range_start = KeyToNumeric(file_smallest);
     features->key_range_end = KeyToNumeric(file_largest);
-    features->key_range_size = num_entries > 0 ? num_entries : 1;
+    features->key_range_size = 0;  // Invalid: keys unset
   }
   features->log10_key_range_size =
       features->key_range_size > 0
           ? std::log10(static_cast<double>(features->key_range_size))
-          : 0.0;
+          : std::numeric_limits<double>::quiet_NaN();
   
   // Validation LOG: Key range
   if (info_log) {
@@ -2877,7 +2406,9 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                      num_entries, level);
     }
   }
+  }  // need_key_effective
 
+  if (need_overlap) {
   // Calculate overlap_with_lower
   if (level < vstorage->num_levels() - 1) {
     std::vector<FileDescriptor> lower_level_file_descriptors;
@@ -2999,16 +2530,15 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   // Note: file_size, log10_file_size, file_size_ratio, file_density, log10_file_density removed
   // These features are not collected before file write
 
-  // Calculate overlap_ratio_with_lower
+  // Calculate overlap_ratio_with_lower and overlap_ratio_with_upper
   if (features->key_range_size > 0) {
     features->overlap_ratio_with_lower =
         static_cast<double>(features->overlap_with_lower) / features->key_range_size;
-  }
-  
-  // Calculate overlap_ratio_with_upper
-  if (features->key_range_size > 0) {
     features->overlap_ratio_with_upper =
         static_cast<double>(features->overlap_with_upper) / features->key_range_size;
+  } else {
+    features->overlap_ratio_with_lower = std::numeric_limits<double>::quiet_NaN();
+    features->overlap_ratio_with_upper = std::numeric_limits<double>::quiet_NaN();
   }
   
   // Validation LOG: Overlaps
@@ -3034,7 +2564,9 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                      level, features->overlap_ratio_with_lower, features->overlap_ratio_with_upper);
     }
   }
+  }  // need_overlap
 
+  if (need_key_effective) {
   // Calculate key_range_position_in_level
   int position = 0;
   for (const auto* f : level_files) {
@@ -3050,14 +2582,16 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
       position++;
     }
   }
-  features->key_range_position_in_level = position;
-  if (current_file_count > 0) {
+  features->key_range_position_in_level = static_cast<double>(position);
+  if (current_file_count > 1) {
     features->key_range_percentile_in_level =
-        (static_cast<double>(features->key_range_position_in_level) /
-         current_file_count) *
-        100.0;
+        static_cast<double>(position) / static_cast<double>(current_file_count - 1);
+  } else {
+    features->key_range_percentile_in_level = 0.0;
   }
+  }  // need_key_effective
 
+  if (need_neighbor) {
   // Calculate neighbor distances
   struct NeighborInfo {
     InternalKey smallest;
@@ -3136,8 +2670,10 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   } else {
     features->avg_neighbor_key_distance = -1.0;
   }
+  }  // need_neighbor
 
-  // ========== Competition Features (56-59) ==========
+  if (need_competition) {
+  // ========== Competition Features (60-63) ==========
   
   // Count files with better/worse scores
   bool all_active_scores_zero = (features->first_active_score == 0.0);
@@ -3164,7 +2700,8 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
         current_file_count;
   }
 
-  // neighbor_files_count
+  // neighbor_files_count - count files that are close neighbors
+  features->neighbor_files_count = 0;
   if (features->left_neighbor_key_distance >= 0.0 &&
       features->left_neighbor_key_distance <= 1.0) {
     features->neighbor_files_count++;
@@ -3173,162 +2710,59 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
       features->right_neighbor_key_distance <= 1.0) {
     features->neighbor_files_count++;
   }
-  const size_t max_neighbor_check = 50;
-  size_t neighbor_checks = 0;
-  for (const auto* other_file : level_files) {
-    if (neighbor_checks >= max_neighbor_check) {
-      break;
-    }
-    if (other_file == nullptr) {
-      continue;
-    }
-    InternalKey other_smallest = other_file->smallest;
-    InternalKey other_largest = other_file->largest;
-    
-    if (other_smallest.unset() || other_largest.unset()) {
-      continue;
-    }
-    if (other_file == left_neighbor || other_file == right_neighbor) {
-      continue;
-    }
-    double distance = 0.0;
-    if (icmp->Compare(other_largest, file_smallest) < 0) {
-      if (!file_smallest.unset() && !other_largest.unset()) {
-        uint64_t file_start = KeyToNumeric(file_smallest);
-        uint64_t other_end = KeyToNumeric(other_largest);
-        distance = static_cast<double>(file_start) - static_cast<double>(other_end);
-      }
-    } else if (icmp->Compare(other_smallest, file_largest) > 0) {
-      if (!file_largest.unset() && !other_smallest.unset()) {
-        uint64_t other_start = KeyToNumeric(other_smallest);
-        uint64_t file_end = KeyToNumeric(file_largest);
-        distance = static_cast<double>(other_start) - static_cast<double>(file_end);
-      }
-    } else {
-      distance = 0.0;
-    }
-    if (std::abs(distance) <= 1.0) {
-      features->neighbor_files_count++;
-      neighbor_checks++;
-    }
-  }
+  }  // need_competition
 
-  // ========== Cross Level Features (60-61) ==========
+  if (need_other) {
+  // ========== Cross Level Features (64-68) ==========
   
-  // lower_level_capacity_ratio
-  // Use NumLevelBytes() directly from RocksDB's data structure instead of manually iterating
+  // lower_level_capacity_ratio = lower_level_size / MaxBytesForLevel(lower_level)
   if (level < vstorage->num_levels() - 1) {
-    uint64_t lower_level_total_size = 0;
-    try {
-      lower_level_total_size = vstorage->NumLevelBytes(level + 1);
-    } catch (...) {
-      if (info_log) {
-        ROCKS_LOG_DEBUG(info_log,
-                        "[ML Features] Exception getting NumLevelBytes for lower level %d",
-                        level + 1);
-      }
-      // Fallback to 0 if NumLevelBytes fails
-      lower_level_total_size = 0;
-    }
-    uint64_t lower_level_capacity = vstorage->MaxBytesForLevel(level + 1);
-    if (lower_level_capacity > 0) {
-      features->lower_level_capacity_ratio =
-          static_cast<double>(lower_level_total_size) / lower_level_capacity;
+    int lower_level = level + 1;
+    uint64_t lower_level_size = vstorage->NumLevelBytes(lower_level);
+    uint64_t lower_level_max = vstorage->MaxBytesForLevel(lower_level);
+    if (lower_level_max > 0) {
+      features->lower_level_capacity_ratio = 
+          static_cast<double>(lower_level_size) / static_cast<double>(lower_level_max);
     }
   }
   
-  // upper_level_capacity_ratio
+  // upper_level_capacity_ratio = upper_level_size / MaxBytesForLevel(upper_level)
   if (level > 0) {
-    uint64_t upper_level_total_size = 0;
-    try {
-      int upper_level_files_count = vstorage->NumLevelFiles(level - 1);
-      if (upper_level_files_count > 0) {
-        const std::vector<FileMetaData*>& upper_level_files_ref = vstorage->LevelFiles(level - 1);
-        const size_t kMaxReasonableFiles = 1000000;
-        size_t upper_level_files_size = static_cast<size_t>(upper_level_files_count);
-        if (upper_level_files_size > kMaxReasonableFiles) {
-          if (info_log) {
-            ROCKS_LOG_ERROR(info_log,
-                            "[ML Features] Invalid upper_level_files size %zu (too large) at level %d",
-                            upper_level_files_size, level);
-          }
-          upper_level_files_size = 0;
-        }
-        
-        for (size_t i = 0; i < upper_level_files_size; ++i) {
-          const FileMetaData* f = nullptr;
-          try {
-            f = upper_level_files_ref[i];
-          } catch (...) {
-            continue;
-          }
-          if (f != nullptr) {
-            try {
-              FileDescriptor f_fd;
-              f_fd.packed_number_and_path_id = f->fd.packed_number_and_path_id;
-              f_fd.file_size = f->fd.file_size;
-              f_fd.smallest_seqno = f->fd.smallest_seqno;
-              f_fd.largest_seqno = f->fd.largest_seqno;
-              f_fd.table_reader = f->fd.table_reader;
-              upper_level_total_size += f_fd.GetFileSize();
-            } catch (...) {
-              continue;
-            }
-          }
-        }
-      }
-      
-      uint64_t upper_level_capacity = vstorage->MaxBytesForLevel(level - 1);
-      if (upper_level_capacity > 0) {
-        features->upper_level_capacity_ratio =
-            static_cast<double>(upper_level_total_size) / upper_level_capacity;
-      }
-    } catch (...) {
-      if (info_log) {
-        ROCKS_LOG_ERROR(info_log,
-                        "[ML Features] Exception calculating upper_level_total_size at level %d",
-                        level);
-      }
+    int upper_level = level - 1;
+    uint64_t upper_level_size = vstorage->NumLevelBytes(upper_level);
+    uint64_t upper_level_max = vstorage->MaxBytesForLevel(upper_level);
+    if (upper_level_max > 0) {
+      features->upper_level_capacity_ratio = 
+          static_cast<double>(upper_level_size) / static_cast<double>(upper_level_max);
     }
   }
 
-  // ========== Composite Scores (62-64) ==========
+  // ========== Composite Scores ==========
   
-  // urgency_score = file_count_ratio × (1 / active_rank_normalized)
+  // urgency_score = file_count_ratio * (1 / active_rank_normalized)
   if (features->active_rank_normalized > 0) {
-    features->urgency_score =
-        features->file_count_ratio / features->active_rank_normalized;
+    features->urgency_score = features->file_count_ratio / features->active_rank_normalized;
   }
 
   // health_score = 1 / (1 + level_avg_score)
   features->health_score = 1.0 / (1.0 + features->level_avg_score);
-
-  // stability_score = active_rank_normalized × (first_active_score / max_score) × health_score
-  double max_score = 0.0;
-  for (const auto& info : file_scores) {
-    max_score = std::max(max_score, info.active_score);
-  }
-  double score_normalized = max_score > 0
-                                ? features->first_active_score / max_score
-                                : 0.0;
-  features->stability_score = features->active_rank_normalized *
-                             score_normalized * features->health_score;
   
-  // Validation LOG: Final summary
+  // stability_score = 1 / (1 + overlap_ratio_with_lower + overlap_ratio_with_upper)
+  features->stability_score = 1.0 / (1.0 + features->overlap_ratio_with_lower + features->overlap_ratio_with_upper);
+  
+  // Validation LOG: Final summary (simplified for 35-feature model)
   if (info_log) {
     ROCKS_LOG_INFO(info_log,
                    "[ML Features Validation] Final summary: level=%d"
                    " first_active_score=%.2f first_passive_score=%.2f"
                    " active_rank=%d passive_rank=%d"
-                   " file_count_ratio=%.6f level_avg_score=%.2f"
-                   " urgency_score=%.6f health_score=%.6f stability_score=%.6f"
+                   " level_avg_score=%.2f urgency_score=%.6f"
                    " key_range_size=%" PRIu64 " overlap_with_lower=%" PRIu64
                    " overlap_with_upper=%" PRIu64,
                    level,
                    features->first_active_score, features->first_passive_score,
                    features->first_active_rank, features->first_passive_rank,
-                   features->file_count_ratio, features->level_avg_score,
-                   features->urgency_score, features->health_score, features->stability_score,
+                   features->level_avg_score, features->urgency_score,
                    features->key_range_size, features->overlap_with_lower,
                    features->overlap_with_upper);
     
@@ -3343,12 +2777,9 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                      "[ML Features Validation] Negative first_passive_score=%.2f at level=%d",
                      features->first_passive_score, level);
     }
-    if (features->health_score < 0.0 || features->health_score > 1.0) {
-      ROCKS_LOG_WARN(info_log,
-                     "[ML Features Validation] health_score out of range [0,1]: %.6f at level=%d",
-                     features->health_score, level);
-    }
+    // REMOVED: health_score validation - not needed for reduced feature set
   }
+  }  // need_other
 
   // Calculation complete, version_guard will release the reference in its destructor
   return true;
@@ -3356,205 +2787,21 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
 
 // Log ML features before file write (style consistent with RocksDB logging)
 // LogMLFeaturesBeforeWrite is not used, keeping for potential future use
+// DISABLED: This function references removed fields, commenting out entire function
 namespace {
 [[maybe_unused]] void LogMLFeaturesBeforeWrite(Logger* info_log, const std::string& cf_name,
                               uint64_t file_number, int level,
                               const MLFeatures& features) {
-  if (info_log == nullptr) {
-    return;
-  }
-  
-  // Suppress unused parameter warning (cf_name was used in commented-out code)
+  // Function disabled due to reduced feature set
+  (void)info_log;
   (void)cf_name;
+  (void)file_number;
+  (void)level;
+  (void)features;
+}  // LogMLFeaturesBeforeWrite function - disabled due to reduced feature set
+}  // anonymous namespace
 
-  // Print 32 features (matching training feature order) in a format similar to RocksDB's table file creation logs
-  // Format: [CF_name] [ML Features Before Write] file_number=... level=... feature1=... feature2=...
-  // Note: Only output features used for training (32 features), matching the model training feature set
-  // Note: key_range_start and key_range_end are printed as log10-transformed values (matching features_array)
-  // DISABLED: Only printing 69 features in JSON format, not the 32-feature text format
-  /*
-  ROCKS_LOG_INFO(info_log,
-                 "[%s] [ML Features Before Write] file_number=%" PRIu64
-                 " level=%d"
-                 " first_active_score=%.2f active_rank_normalized=%.6f"
-                 " first_passive_score=%.2f passive_rank_normalized=%.6f"
-                 " file_count_ratio=%.6f level_avg_score=%.2f"
-                 " level0_current_file_count=%" PRIu64
-                 " level1_current_file_count=%" PRIu64
-                 " level2_current_file_count=%" PRIu64
-                 " level3_current_file_count=%" PRIu64
-                 " level4_current_file_count=%" PRIu64
-                 " level5_current_file_count=%" PRIu64
-                 " level0_cumulative_compaction_count=%" PRIu64 " level1_cumulative_compaction_count=%" PRIu64
-                 " level2_cumulative_compaction_count=%" PRIu64 " level3_cumulative_compaction_count=%" PRIu64
-                 " level4_cumulative_compaction_count=%" PRIu64 " level5_cumulative_compaction_count=%" PRIu64
-                 " level1_cumulative_trivial_move_count=%" PRIu64 " level2_cumulative_trivial_move_count=%" PRIu64
-                 " level3_cumulative_trivial_move_count=%" PRIu64 " level4_cumulative_trivial_move_count=%" PRIu64
-                 " level5_cumulative_trivial_move_count=%" PRIu64
-                 " level1_total_size=%" PRIu64 " level2_total_size=%" PRIu64
-                 " level3_total_size=%" PRIu64 " level4_total_size=%" PRIu64
-                 " level5_total_size=%" PRIu64
-                 " key_range=\"%s\" key_range_start_log10=%.6f key_range_end_log10=%.6f log10_key_range_size=%.6f"
-                 " overlap_with_lower=%" PRIu64
-                 " overlap_count_with_lower=%" PRIu64 " overlap_ratio_with_lower=%.6f"
-                 " overlap_count_with_upper=%" PRIu64 " overlap_ratio_with_upper=%.6f"
-                 " key_range_position_in_level=%.6f key_range_percentile_in_level=%.6f"
-                 " left_neighbor_key_distance=%.6f right_neighbor_key_distance=%.6f"
-                 " min_neighbor_key_distance=%.6f avg_neighbor_key_distance=%.6f"
-                 " competition_ratio=%.6f better_score_files_count=%" PRIu64 " worse_score_files_count=%" PRIu64
-                 " neighbor_files_count=%" PRIu64 " lower_level_capacity_ratio=%.6f upper_level_capacity_ratio=%.6f"
-                 " urgency_score=%.6f health_score=%.6f",
-                 cf_name.c_str(), file_number, level,
-                 features.first_active_score, features.active_rank_normalized,
-                 features.first_passive_score, features.passive_rank_normalized,
-                 features.file_count_ratio, features.level_avg_score,
-                 features.level0_current_file_count,
-                 features.level1_current_file_count,
-                 features.level2_current_file_count,
-                 features.level3_current_file_count,
-                 features.level4_current_file_count,
-                 features.level5_current_file_count,
-                 features.level0_cumulative_compaction_count, features.level1_cumulative_compaction_count,
-                 features.level2_cumulative_compaction_count, features.level3_cumulative_compaction_count,
-                 features.level4_cumulative_compaction_count, features.level5_cumulative_compaction_count,
-                 features.level1_cumulative_trivial_move_count, features.level2_cumulative_trivial_move_count,
-                 features.level3_cumulative_trivial_move_count, features.level4_cumulative_trivial_move_count,
-                 features.level5_cumulative_trivial_move_count,
-                 features.level1_total_size, features.level2_total_size,
-                 features.level3_total_size, features.level4_total_size,
-                 features.level5_total_size,
-                 features.key_range.c_str(), 
-                 std::log10(static_cast<double>(features.key_range_start) + 1.0),  // log10-transformed value
-                 std::log10(static_cast<double>(features.key_range_end) + 1.0),  // log10-transformed value
-                 features.log10_key_range_size,
-                 features.overlap_with_lower,
-                 features.overlap_count_with_lower, features.overlap_ratio_with_lower,
-                 features.overlap_count_with_upper, features.overlap_ratio_with_upper,
-                 features.key_range_position_in_level, features.key_range_percentile_in_level,
-                 features.left_neighbor_key_distance, features.right_neighbor_key_distance,
-                 features.min_neighbor_key_distance, features.avg_neighbor_key_distance,
-                 features.competition_ratio, features.better_score_files_count, features.worse_score_files_count,
-                 features.neighbor_files_count, features.lower_level_capacity_ratio, features.upper_level_capacity_ratio,
-                 features.urgency_score, features.health_score);
-  */
-  
-  // ============================================================================
-  // Log ALL features (69 features) from MLFeatures structure
-  // This is for data extraction purposes, not just the 32 features used for model
-  // ============================================================================
-  if (info_log != nullptr) {
-    std::ostringstream oss_all;
-    oss_all.setf(std::ios::fixed);
-    oss_all << std::setprecision(6);
-    oss_all << "{\"ML_FEATURES_ALL\": {";
-    if (file_number > 0) {
-      oss_all << "\"file_number\": " << file_number << ", ";
-    }
-    oss_all << "\"level\": " << level << ", \"features\": {";
-    
-    // Rank features
-    oss_all << "\"first_active_rank\": " << features.first_active_rank << ", ";
-    oss_all << "\"first_passive_rank\": " << features.first_passive_rank << ", ";
-    oss_all << "\"active_rank_normalized\": " << features.active_rank_normalized << ", ";
-    oss_all << "\"passive_rank_normalized\": " << features.passive_rank_normalized << ", ";
-    oss_all << "\"file_count_ratio\": " << features.file_count_ratio << ", ";
-    
-    // Score features
-    oss_all << "\"first_active_score\": " << features.first_active_score << ", ";
-    oss_all << "\"first_passive_score\": " << features.first_passive_score << ", ";
-    oss_all << "\"level_avg_score\": " << features.level_avg_score << ", ";
-    oss_all << "\"score_rank_interaction\": " << features.score_rank_interaction << ", ";
-    oss_all << "\"rank_difference\": " << features.rank_difference << ", ";
-    oss_all << "\"score_difference\": " << features.score_difference << ", ";
-    
-    // Key range features
-    oss_all << "\"key_range_start\": " << features.key_range_start << ", ";
-    oss_all << "\"key_range_end\": " << features.key_range_end << ", ";
-    oss_all << "\"key_range_size\": " << features.key_range_size << ", ";
-    oss_all << "\"log10_key_range_size\": " << features.log10_key_range_size << ", ";
-    oss_all << "\"key_range_position_in_level\": " << features.key_range_position_in_level << ", ";
-    oss_all << "\"key_range_percentile_in_level\": " << features.key_range_percentile_in_level << ", ";
-    
-    // Level 0 features
-    oss_all << "\"level0_current_file_count\": " << features.level0_current_file_count << ", ";
-    oss_all << "\"level0_cumulative_compaction_count\": " << features.level0_cumulative_compaction_count << ", ";
-    oss_all << "\"level0_cumulative_file_count\": " << features.level0_cumulative_file_count << ", ";
-    
-    // Level 1 features
-    oss_all << "\"level1_current_file_count\": " << features.level1_current_file_count << ", ";
-    oss_all << "\"level1_cumulative_compaction_count\": " << features.level1_cumulative_compaction_count << ", ";
-    oss_all << "\"level1_cumulative_file_count\": " << features.level1_cumulative_file_count << ", ";
-    oss_all << "\"level1_cumulative_trivial_move_count\": " << features.level1_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level1_total_size\": " << features.level1_total_size << ", ";
-    
-    // Level 2 features
-    oss_all << "\"level2_current_file_count\": " << features.level2_current_file_count << ", ";
-    oss_all << "\"level2_cumulative_compaction_count\": " << features.level2_cumulative_compaction_count << ", ";
-    oss_all << "\"level2_cumulative_file_count\": " << features.level2_cumulative_file_count << ", ";
-    oss_all << "\"level2_cumulative_trivial_move_count\": " << features.level2_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level2_total_size\": " << features.level2_total_size << ", ";
-    
-    // Level 3 features
-    oss_all << "\"level3_current_file_count\": " << features.level3_current_file_count << ", ";
-    oss_all << "\"level3_cumulative_compaction_count\": " << features.level3_cumulative_compaction_count << ", ";
-    oss_all << "\"level3_cumulative_file_count\": " << features.level3_cumulative_file_count << ", ";
-    oss_all << "\"level3_cumulative_trivial_move_count\": " << features.level3_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level3_total_size\": " << features.level3_total_size << ", ";
-    
-    // Level 4 features
-    oss_all << "\"level4_current_file_count\": " << features.level4_current_file_count << ", ";
-    oss_all << "\"level4_cumulative_compaction_count\": " << features.level4_cumulative_compaction_count << ", ";
-    oss_all << "\"level4_cumulative_file_count\": " << features.level4_cumulative_file_count << ", ";
-    oss_all << "\"level4_cumulative_trivial_move_count\": " << features.level4_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level4_total_size\": " << features.level4_total_size << ", ";
-    
-    // Level 5 features
-    oss_all << "\"level5_current_file_count\": " << features.level5_current_file_count << ", ";
-    oss_all << "\"level5_cumulative_compaction_count\": " << features.level5_cumulative_compaction_count << ", ";
-    oss_all << "\"level5_cumulative_file_count\": " << features.level5_cumulative_file_count << ", ";
-    oss_all << "\"level5_cumulative_trivial_move_count\": " << features.level5_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level5_total_size\": " << features.level5_total_size << ", ";
-    
-    // Level 6 features
-    oss_all << "\"level6_current_file_count\": " << features.level6_current_file_count << ", ";
-    oss_all << "\"level6_cumulative_compaction_count\": " << features.level6_cumulative_compaction_count << ", ";
-    oss_all << "\"level6_cumulative_file_count\": " << features.level6_cumulative_file_count << ", ";
-    oss_all << "\"level6_cumulative_trivial_move_count\": " << features.level6_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level6_total_size\": " << features.level6_total_size << ", ";
-    
-    // Overlap features
-    oss_all << "\"overlap_with_lower\": " << features.overlap_with_lower << ", ";
-    oss_all << "\"overlap_with_upper\": " << features.overlap_with_upper << ", ";
-    oss_all << "\"overlap_count_with_lower\": " << features.overlap_count_with_lower << ", ";
-    oss_all << "\"overlap_count_with_upper\": " << features.overlap_count_with_upper << ", ";
-    oss_all << "\"overlap_ratio_with_lower\": " << features.overlap_ratio_with_lower << ", ";
-    oss_all << "\"overlap_ratio_with_upper\": " << features.overlap_ratio_with_upper << ", ";
-    
-    // Neighbor features
-    oss_all << "\"left_neighbor_key_distance\": " << features.left_neighbor_key_distance << ", ";
-    oss_all << "\"right_neighbor_key_distance\": " << features.right_neighbor_key_distance << ", ";
-    oss_all << "\"min_neighbor_key_distance\": " << features.min_neighbor_key_distance << ", ";
-    oss_all << "\"avg_neighbor_key_distance\": " << features.avg_neighbor_key_distance << ", ";
-    
-    // Competition features
-    oss_all << "\"better_score_files_count\": " << features.better_score_files_count << ", ";
-    oss_all << "\"worse_score_files_count\": " << features.worse_score_files_count << ", ";
-    oss_all << "\"competition_ratio\": " << features.competition_ratio << ", ";
-    oss_all << "\"neighbor_files_count\": " << features.neighbor_files_count << ", ";
-    
-    // Capacity/health features
-    oss_all << "\"lower_level_capacity_ratio\": " << features.lower_level_capacity_ratio << ", ";
-    oss_all << "\"upper_level_capacity_ratio\": " << features.upper_level_capacity_ratio << ", ";
-    oss_all << "\"urgency_score\": " << features.urgency_score << ", ";
-    oss_all << "\"health_score\": " << features.health_score << ", ";
-    oss_all << "\"stability_score\": " << features.stability_score;
-    
-    oss_all << "}}}";
-    ROCKS_LOG_INFO(info_log, "%s", oss_all.str().c_str());
-  }
-}  // anonymous namespace (LogMLFeaturesBeforeWrite)
-}  // Close LogMLFeaturesBeforeWrite function
-
+#ifdef ROCKSDB_ML_PREDICT_PYTHON
 // These functions are in ROCKSDB_NAMESPACE, not anonymous namespace
 // Predict file lifetime from ML features
 // Returns predicted lifetime in seconds (0 if prediction fails)
@@ -3589,85 +2836,50 @@ namespace {
     return 0.0;  // Use fallback (level-based hint)
   }
   
-  // Convert MLFeatures to array (69 features) in the exact order used for training
-  // Order must match training data (from extract_ml_features.py FEATURE_NAMES)
-  // This matches the order in which features are logged in LogMLFeaturesBeforeWrite
-  // Build 69 features array matching extract_ml_features.py FEATURE_NAMES order
-  double features_array[69] = {
+  // Convert MLFeatures to array (35 features, reduced from 69) in the exact order used for training
+  // Order must match training data (from train_models_35_features.py)
+  // Build 35 features array matching the reduced feature set
+  double features_array[35] = {
     static_cast<double>(features.first_active_rank),  // 0
     static_cast<double>(features.first_passive_rank),  // 1
     features.active_rank_normalized,  // 2
     features.passive_rank_normalized,  // 3
-    features.file_count_ratio,  // 4
-    features.first_active_score,  // 5
-    features.first_passive_score,  // 6
-    features.level_avg_score,  // 7
-    features.score_rank_interaction,  // 8
-    features.rank_difference,  // 9
-    features.score_difference,  // 10
-    static_cast<double>(features.key_range_start),  // 11
-    static_cast<double>(features.key_range_end),  // 12
-    static_cast<double>(features.key_range_size),  // 13
-    features.log10_key_range_size,  // 14
-    features.key_range_position_in_level,  // 15
-    features.key_range_percentile_in_level,  // 16
-    static_cast<double>(features.level0_current_file_count),  // 17
-    static_cast<double>(features.level0_cumulative_compaction_count),  // 18
-    static_cast<double>(features.level0_cumulative_file_count),  // 19
-    static_cast<double>(features.level1_current_file_count),  // 20
-    static_cast<double>(features.level1_cumulative_compaction_count),  // 21
-    static_cast<double>(features.level1_cumulative_file_count),  // 22
-    static_cast<double>(features.level1_cumulative_trivial_move_count),  // 23
-    static_cast<double>(features.level1_total_size),  // 24
-    static_cast<double>(features.level2_current_file_count),  // 25
-    static_cast<double>(features.level2_cumulative_compaction_count),  // 26
-    static_cast<double>(features.level2_cumulative_file_count),  // 27
-    static_cast<double>(features.level2_cumulative_trivial_move_count),  // 28
-    static_cast<double>(features.level2_total_size),  // 29
-    static_cast<double>(features.level3_current_file_count),  // 30
-    static_cast<double>(features.level3_cumulative_compaction_count),  // 31
-    static_cast<double>(features.level3_cumulative_file_count),  // 32
-    static_cast<double>(features.level3_cumulative_trivial_move_count),  // 33
-    static_cast<double>(features.level3_total_size),  // 34
-    static_cast<double>(features.level4_current_file_count),  // 35
-    static_cast<double>(features.level4_cumulative_compaction_count),  // 36
-    static_cast<double>(features.level4_cumulative_file_count),  // 37
-    static_cast<double>(features.level4_cumulative_trivial_move_count),  // 38
-    static_cast<double>(features.level4_total_size),  // 39
-    static_cast<double>(features.level5_current_file_count),  // 40
-    static_cast<double>(features.level5_cumulative_compaction_count),  // 41
-    static_cast<double>(features.level5_cumulative_file_count),  // 42
-    static_cast<double>(features.level5_cumulative_trivial_move_count),  // 43
-    static_cast<double>(features.level5_total_size),  // 44
-    static_cast<double>(features.level6_current_file_count),  // 45
-    static_cast<double>(features.level6_cumulative_compaction_count),  // 46
-    static_cast<double>(features.level6_cumulative_file_count),  // 47
-    static_cast<double>(features.level6_cumulative_trivial_move_count),  // 48
-    static_cast<double>(features.level6_total_size),  // 49
-    static_cast<double>(features.overlap_with_lower),  // 50
-    static_cast<double>(features.overlap_with_upper),  // 51
-    static_cast<double>(features.overlap_count_with_lower),  // 52
-    static_cast<double>(features.overlap_count_with_upper),  // 53
-    features.overlap_ratio_with_lower,  // 54
-    features.overlap_ratio_with_upper,  // 55
-    features.left_neighbor_key_distance,  // 56
-    features.right_neighbor_key_distance,  // 57
-    features.min_neighbor_key_distance,  // 58
-    features.avg_neighbor_key_distance,  // 59
-    static_cast<double>(features.better_score_files_count),  // 60
-    static_cast<double>(features.worse_score_files_count),  // 61
-    features.competition_ratio,  // 62
-    static_cast<double>(features.neighbor_files_count),  // 63
-    features.lower_level_capacity_ratio,  // 64
-    features.upper_level_capacity_ratio,  // 65
-    features.urgency_score,  // 66
-    features.health_score,  // 67
-    features.stability_score,  // 68
+    features.first_active_score,  // 4
+    features.first_passive_score,  // 5
+    features.level_avg_score,  // 6
+    features.score_rank_interaction,  // 7
+    static_cast<double>(features.key_range_start),  // 8
+    static_cast<double>(features.key_range_end),  // 9
+    static_cast<double>(features.key_range_size),  // 10
+    features.log10_key_range_size,  // 11
+    static_cast<double>(features.level0_cumulative_compaction_count),  // 12
+    static_cast<double>(features.level1_cumulative_compaction_count),  // 13
+    static_cast<double>(features.level2_cumulative_compaction_count),  // 14
+    static_cast<double>(features.level2_total_size),  // 15
+    static_cast<double>(features.level4_current_file_count),  // 16
+    static_cast<double>(features.level4_cumulative_compaction_count),  // 17
+    static_cast<double>(features.level5_current_file_count),  // 18
+    static_cast<double>(features.level5_cumulative_compaction_count),  // 19
+    static_cast<double>(features.level5_total_size),  // 20
+    static_cast<double>(features.overlap_with_lower),  // 21
+    static_cast<double>(features.overlap_with_upper),  // 22
+    static_cast<double>(features.overlap_count_with_lower),  // 23
+    static_cast<double>(features.overlap_count_with_upper),  // 24
+    features.overlap_ratio_with_lower,  // 25
+    features.overlap_ratio_with_upper,  // 26
+    features.left_neighbor_key_distance,  // 27
+    features.right_neighbor_key_distance,  // 28
+    features.min_neighbor_key_distance,  // 29
+    features.avg_neighbor_key_distance,  // 30
+    static_cast<double>(features.better_score_files_count),  // 31
+    static_cast<double>(features.worse_score_files_count),  // 32
+    features.competition_ratio,  // 33
+    features.urgency_score,  // 34
   };
   
   // Validate features: NaN, Inf values indicate a problem
   // Log errors but continue to let the problem expose itself
-  for (size_t i = 0; i < 69; i++) {
+  for (size_t i = 0; i < 35; i++) {
     if (std::isnan(features_array[i])) {
       if (info_log != nullptr) {
         ROCKS_LOG_ERROR(info_log, "[ML Features] ERROR: NaN detected in feature[%zu] at file_number=%" PRIu64 ", level=%d - WILL PASS TO MODEL", 
@@ -3749,164 +2961,56 @@ namespace {
     ROCKS_LOG_INFO(info_log, "%s", oss.str().c_str());
   }
   
-  // ============================================================================
-  // Log ALL features (69 features) from MLFeatures structure
-  // This is for data extraction purposes, not just the 32 features used for model
-  // ============================================================================
-  if (info_log != nullptr) {
-    std::ostringstream oss_all;
-    oss_all.setf(std::ios::fixed);
-    oss_all << std::setprecision(6);
-    oss_all << "{\"ML_FEATURES_ALL\": {";
-    if (file_number > 0) {
-      oss_all << "\"file_number\": " << file_number << ", ";
-    }
-    oss_all << "\"level\": " << level << ", \"features\": {";
-    
-    // Rank features
-    oss_all << "\"first_active_rank\": " << features.first_active_rank << ", ";
-    oss_all << "\"first_passive_rank\": " << features.first_passive_rank << ", ";
-    oss_all << "\"active_rank_normalized\": " << features.active_rank_normalized << ", ";
-    oss_all << "\"passive_rank_normalized\": " << features.passive_rank_normalized << ", ";
-    oss_all << "\"file_count_ratio\": " << features.file_count_ratio << ", ";
-    
-    // Score features
-    oss_all << "\"first_active_score\": " << features.first_active_score << ", ";
-    oss_all << "\"first_passive_score\": " << features.first_passive_score << ", ";
-    oss_all << "\"level_avg_score\": " << features.level_avg_score << ", ";
-    oss_all << "\"score_rank_interaction\": " << features.score_rank_interaction << ", ";
-    oss_all << "\"rank_difference\": " << features.rank_difference << ", ";
-    oss_all << "\"score_difference\": " << features.score_difference << ", ";
-    
-    // Key range features
-    oss_all << "\"key_range_start\": " << features.key_range_start << ", ";
-    oss_all << "\"key_range_end\": " << features.key_range_end << ", ";
-    oss_all << "\"key_range_size\": " << features.key_range_size << ", ";
-    oss_all << "\"log10_key_range_size\": " << features.log10_key_range_size << ", ";
-    oss_all << "\"key_range_position_in_level\": " << features.key_range_position_in_level << ", ";
-    oss_all << "\"key_range_percentile_in_level\": " << features.key_range_percentile_in_level << ", ";
-    
-    // Level 0 features
-    oss_all << "\"level0_current_file_count\": " << features.level0_current_file_count << ", ";
-    oss_all << "\"level0_cumulative_compaction_count\": " << features.level0_cumulative_compaction_count << ", ";
-    oss_all << "\"level0_cumulative_file_count\": " << features.level0_cumulative_file_count << ", ";
-    
-    // Level 1 features
-    oss_all << "\"level1_current_file_count\": " << features.level1_current_file_count << ", ";
-    oss_all << "\"level1_cumulative_compaction_count\": " << features.level1_cumulative_compaction_count << ", ";
-    oss_all << "\"level1_cumulative_file_count\": " << features.level1_cumulative_file_count << ", ";
-    oss_all << "\"level1_cumulative_trivial_move_count\": " << features.level1_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level1_total_size\": " << features.level1_total_size << ", ";
-    
-    // Level 2 features
-    oss_all << "\"level2_current_file_count\": " << features.level2_current_file_count << ", ";
-    oss_all << "\"level2_cumulative_compaction_count\": " << features.level2_cumulative_compaction_count << ", ";
-    oss_all << "\"level2_cumulative_file_count\": " << features.level2_cumulative_file_count << ", ";
-    oss_all << "\"level2_cumulative_trivial_move_count\": " << features.level2_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level2_total_size\": " << features.level2_total_size << ", ";
-    
-    // Level 3 features
-    oss_all << "\"level3_current_file_count\": " << features.level3_current_file_count << ", ";
-    oss_all << "\"level3_cumulative_compaction_count\": " << features.level3_cumulative_compaction_count << ", ";
-    oss_all << "\"level3_cumulative_file_count\": " << features.level3_cumulative_file_count << ", ";
-    oss_all << "\"level3_cumulative_trivial_move_count\": " << features.level3_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level3_total_size\": " << features.level3_total_size << ", ";
-    
-    // Level 4 features
-    oss_all << "\"level4_current_file_count\": " << features.level4_current_file_count << ", ";
-    oss_all << "\"level4_cumulative_compaction_count\": " << features.level4_cumulative_compaction_count << ", ";
-    oss_all << "\"level4_cumulative_file_count\": " << features.level4_cumulative_file_count << ", ";
-    oss_all << "\"level4_cumulative_trivial_move_count\": " << features.level4_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level4_total_size\": " << features.level4_total_size << ", ";
-    
-    // Level 5 features
-    oss_all << "\"level5_current_file_count\": " << features.level5_current_file_count << ", ";
-    oss_all << "\"level5_cumulative_compaction_count\": " << features.level5_cumulative_compaction_count << ", ";
-    oss_all << "\"level5_cumulative_file_count\": " << features.level5_cumulative_file_count << ", ";
-    oss_all << "\"level5_cumulative_trivial_move_count\": " << features.level5_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level5_total_size\": " << features.level5_total_size << ", ";
-    
-    // Level 6 features
-    oss_all << "\"level6_current_file_count\": " << features.level6_current_file_count << ", ";
-    oss_all << "\"level6_cumulative_compaction_count\": " << features.level6_cumulative_compaction_count << ", ";
-    oss_all << "\"level6_cumulative_file_count\": " << features.level6_cumulative_file_count << ", ";
-    oss_all << "\"level6_cumulative_trivial_move_count\": " << features.level6_cumulative_trivial_move_count << ", ";
-    oss_all << "\"level6_total_size\": " << features.level6_total_size << ", ";
-    
-    // Overlap features
-    oss_all << "\"overlap_with_lower\": " << features.overlap_with_lower << ", ";
-    oss_all << "\"overlap_with_upper\": " << features.overlap_with_upper << ", ";
-    oss_all << "\"overlap_count_with_lower\": " << features.overlap_count_with_lower << ", ";
-    oss_all << "\"overlap_count_with_upper\": " << features.overlap_count_with_upper << ", ";
-    oss_all << "\"overlap_ratio_with_lower\": " << features.overlap_ratio_with_lower << ", ";
-    oss_all << "\"overlap_ratio_with_upper\": " << features.overlap_ratio_with_upper << ", ";
-    
-    // Neighbor features
-    oss_all << "\"left_neighbor_key_distance\": " << features.left_neighbor_key_distance << ", ";
-    oss_all << "\"right_neighbor_key_distance\": " << features.right_neighbor_key_distance << ", ";
-    oss_all << "\"min_neighbor_key_distance\": " << features.min_neighbor_key_distance << ", ";
-    oss_all << "\"avg_neighbor_key_distance\": " << features.avg_neighbor_key_distance << ", ";
-    
-    // Competition features
-    oss_all << "\"better_score_files_count\": " << features.better_score_files_count << ", ";
-    oss_all << "\"worse_score_files_count\": " << features.worse_score_files_count << ", ";
-    oss_all << "\"competition_ratio\": " << features.competition_ratio << ", ";
-    oss_all << "\"neighbor_files_count\": " << features.neighbor_files_count << ", ";
-    
-    // Capacity/health features
-    oss_all << "\"lower_level_capacity_ratio\": " << features.lower_level_capacity_ratio << ", ";
-    oss_all << "\"upper_level_capacity_ratio\": " << features.upper_level_capacity_ratio << ", ";
-    oss_all << "\"urgency_score\": " << features.urgency_score << ", ";
-    oss_all << "\"health_score\": " << features.health_score << ", ";
-    oss_all << "\"stability_score\": " << features.stability_score;
-    
-    oss_all << "}}}";
-    ROCKS_LOG_INFO(info_log, "%s", oss_all.str().c_str());
-  }
+  // REMOVED - 69-feature logging block (not needed for 35-feature model)
+  // The 35 features are already logged in the features_array block above
   
   // ============================================================================
   // CRITICAL: Print features BEFORE passing to Python model
   // This is AFTER all preprocessing (log10 transform, etc.) and BEFORE model input
+  // Updated for 35-feature model
   // ============================================================================
-  static const char* feature_names_for_print[32] = {
-    "active_rank_normalized",           // 0
-    "file_count_ratio",                 // 1
-    "first_active_score",               // 2
-    "first_passive_score",              // 3
-    "key_range_end",                    // 4 (log10 transformed)
-    "key_range_start",                  // 5 (log10 transformed)
-    "level0_cumulative_compaction_count",  // 6
-    "level0_current_file_count",        // 7
-    "level1_cumulative_compaction_count",  // 8
-    "level1_cumulative_trivial_move_count",  // 9
-    "level1_current_file_count",        // 10
-    "level1_total_size",                // 11
-    "level2_cumulative_compaction_count",  // 12
-    "level2_cumulative_trivial_move_count",  // 13
-    "level2_current_file_count",        // 14
+  static const char* feature_names_for_print[35] = {
+    "first_active_rank",                // 0
+    "first_passive_rank",               // 1
+    "active_rank_normalized",           // 2
+    "passive_rank_normalized",          // 3
+    "first_active_score",               // 4
+    "first_passive_score",              // 5
+    "level_avg_score",                  // 6
+    "score_rank_interaction",           // 7
+    "key_range_start",                  // 8
+    "key_range_end",                    // 9
+    "key_range_size",                   // 10
+    "log10_key_range_size",             // 11
+    "level0_cumulative_compaction_count",  // 12
+    "level1_cumulative_compaction_count",  // 13
+    "level2_cumulative_compaction_count",  // 14
     "level2_total_size",                // 15
-    "level3_cumulative_compaction_count",  // 16
-    "level3_cumulative_trivial_move_count",  // 17
-    "level3_current_file_count",        // 18
-    "level3_total_size",                // 19
-    "level4_cumulative_compaction_count",  // 20
-    "level4_cumulative_trivial_move_count",  // 21
-    "level4_current_file_count",        // 22
-    "level4_total_size",                // 23
-    "level5_cumulative_compaction_count",  // 24
-    "level5_cumulative_trivial_move_count",  // 25
-    "level5_current_file_count",        // 26
-    "level5_total_size",                // 27
-    "level_avg_score",                  // 28
-    "log10_key_range_size",             // 29
-    "overlap_with_lower",               // 30
-    "passive_rank_normalized",          // 31
+    "level4_current_file_count",        // 16
+    "level4_cumulative_compaction_count",  // 17
+    "level5_current_file_count",        // 18
+    "level5_cumulative_compaction_count",  // 19
+    "level5_total_size",                // 20
+    "overlap_with_lower",               // 21
+    "overlap_with_upper",               // 22
+    "overlap_count_with_lower",         // 23
+    "overlap_count_with_upper",         // 24
+    "overlap_ratio_with_lower",         // 25
+    "overlap_ratio_with_upper",         // 26
+    "left_neighbor_key_distance",       // 27
+    "right_neighbor_key_distance",      // 28
+    "min_neighbor_key_distance",        // 29
+    "avg_neighbor_key_distance",        // 30
+    "better_score_files_count",         // 31
+    "worse_score_files_count",          // 32
+    "competition_ratio",                // 33
+    "urgency_score",                    // 34
   };
   
   // ALWAYS print features before model input using RocksDB LOG (writes to db1/LOG)
   if (info_log != nullptr) {
     double min_feature = features_array[0], max_feature = features_array[0];
-    for (size_t i = 0; i < 32; i++) {
+    for (size_t i = 0; i < 35; i++) {
       if (!std::isnan(features_array[i]) && !std::isinf(features_array[i])) {
         if (features_array[i] < min_feature) min_feature = features_array[i];
         if (features_array[i] > max_feature) max_feature = features_array[i];
@@ -3916,10 +3020,10 @@ namespace {
     // Log header
     ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL] ==========================================");
     ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL] level=%d, file_number=%" PRIu64, level, file_number);
-    ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL] Features (AFTER preprocessing, BEFORE model input):");
+    ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL] Features (35 features, BEFORE model input):");
     
     // Log each feature
-    for (size_t i = 0; i < 32; i++) {
+    for (size_t i = 0; i < 35; i++) {
       if (std::isnan(features_array[i]) || std::isinf(features_array[i])) {
         ROCKS_LOG_ERROR(info_log, "[ML FEATURES TO MODEL] ERROR: Invalid feature[%zu]=%.6f (NaN/Inf) - %s", 
                         i, features_array[i], feature_names_for_print[i]);
@@ -3948,6 +3052,7 @@ namespace {
   
   return predicted_lifetime;
 }
+#endif  // ROCKSDB_ML_PREDICT_PYTHON
 
 // Map predicted lifetime to WriteLifeTimeHint
 // Mapping strategy:
@@ -3960,13 +3065,16 @@ namespace {
 //   - 150-200s: WLTH_LEVEL4
 //   - 200-400s: WLTH_LEVEL5
 //   - > 400s:   WLTH_LEVEL6
-// Convert MLFeatures to 69-element double array (matching training order)
+// Convert MLFeatures to 35-element double array (matching training order)
+// Reduced from 69 features based on feature importance analysis
 // MLFeaturesToArray is declared in event_helpers_ml_features.h
+// Converts MLFeatures to 69-element double array matching training data order
 void MLFeaturesToArray(const MLFeatures& features, double* features_array, size_t array_size) {
   if (array_size < 69) {
     return;  // Array too small
   }
   
+  // Rank/Score features (11 features, indices 0-10)
   features_array[0] = static_cast<double>(features.first_active_rank);
   features_array[1] = static_cast<double>(features.first_passive_rank);
   features_array[2] = features.active_rank_normalized;
@@ -3976,61 +3084,80 @@ void MLFeaturesToArray(const MLFeatures& features, double* features_array, size_
   features_array[6] = features.first_passive_score;
   features_array[7] = features.level_avg_score;
   features_array[8] = features.score_rank_interaction;
-  features_array[9] = features.rank_difference;
+  features_array[9] = static_cast<double>(features.rank_difference);
   features_array[10] = features.score_difference;
+  
+  // Key Range features (6 features, indices 11-16)
   features_array[11] = static_cast<double>(features.key_range_start);
   features_array[12] = static_cast<double>(features.key_range_end);
   features_array[13] = static_cast<double>(features.key_range_size);
   features_array[14] = features.log10_key_range_size;
   features_array[15] = features.key_range_position_in_level;
   features_array[16] = features.key_range_percentile_in_level;
+  
+  // Level Stats features (33 features, indices 17-49)
+  // Level 0
   features_array[17] = static_cast<double>(features.level0_current_file_count);
   features_array[18] = static_cast<double>(features.level0_cumulative_compaction_count);
   features_array[19] = static_cast<double>(features.level0_cumulative_file_count);
+  // Level 1
   features_array[20] = static_cast<double>(features.level1_current_file_count);
   features_array[21] = static_cast<double>(features.level1_cumulative_compaction_count);
   features_array[22] = static_cast<double>(features.level1_cumulative_file_count);
   features_array[23] = static_cast<double>(features.level1_cumulative_trivial_move_count);
   features_array[24] = static_cast<double>(features.level1_total_size);
+  // Level 2
   features_array[25] = static_cast<double>(features.level2_current_file_count);
   features_array[26] = static_cast<double>(features.level2_cumulative_compaction_count);
   features_array[27] = static_cast<double>(features.level2_cumulative_file_count);
   features_array[28] = static_cast<double>(features.level2_cumulative_trivial_move_count);
   features_array[29] = static_cast<double>(features.level2_total_size);
+  // Level 3
   features_array[30] = static_cast<double>(features.level3_current_file_count);
   features_array[31] = static_cast<double>(features.level3_cumulative_compaction_count);
   features_array[32] = static_cast<double>(features.level3_cumulative_file_count);
   features_array[33] = static_cast<double>(features.level3_cumulative_trivial_move_count);
   features_array[34] = static_cast<double>(features.level3_total_size);
+  // Level 4
   features_array[35] = static_cast<double>(features.level4_current_file_count);
   features_array[36] = static_cast<double>(features.level4_cumulative_compaction_count);
   features_array[37] = static_cast<double>(features.level4_cumulative_file_count);
   features_array[38] = static_cast<double>(features.level4_cumulative_trivial_move_count);
   features_array[39] = static_cast<double>(features.level4_total_size);
+  // Level 5
   features_array[40] = static_cast<double>(features.level5_current_file_count);
   features_array[41] = static_cast<double>(features.level5_cumulative_compaction_count);
   features_array[42] = static_cast<double>(features.level5_cumulative_file_count);
   features_array[43] = static_cast<double>(features.level5_cumulative_trivial_move_count);
   features_array[44] = static_cast<double>(features.level5_total_size);
+  // Level 6
   features_array[45] = static_cast<double>(features.level6_current_file_count);
   features_array[46] = static_cast<double>(features.level6_cumulative_compaction_count);
   features_array[47] = static_cast<double>(features.level6_cumulative_file_count);
   features_array[48] = static_cast<double>(features.level6_cumulative_trivial_move_count);
   features_array[49] = static_cast<double>(features.level6_total_size);
+  
+  // Overlap features (6 features, indices 50-55)
   features_array[50] = static_cast<double>(features.overlap_with_lower);
   features_array[51] = static_cast<double>(features.overlap_with_upper);
   features_array[52] = static_cast<double>(features.overlap_count_with_lower);
   features_array[53] = static_cast<double>(features.overlap_count_with_upper);
   features_array[54] = features.overlap_ratio_with_lower;
   features_array[55] = features.overlap_ratio_with_upper;
+  
+  // Neighbor features (4 features, indices 56-59)
   features_array[56] = features.left_neighbor_key_distance;
   features_array[57] = features.right_neighbor_key_distance;
   features_array[58] = features.min_neighbor_key_distance;
   features_array[59] = features.avg_neighbor_key_distance;
+  
+  // Competition features (4 features, indices 60-63)
   features_array[60] = static_cast<double>(features.better_score_files_count);
   features_array[61] = static_cast<double>(features.worse_score_files_count);
   features_array[62] = features.competition_ratio;
   features_array[63] = static_cast<double>(features.neighbor_files_count);
+  
+  // Other features (5 features, indices 64-68)
   features_array[64] = features.lower_level_capacity_ratio;
   features_array[65] = features.upper_level_capacity_ratio;
   features_array[66] = features.urgency_score;
@@ -4080,61 +3207,32 @@ bool InitializeMLPredictorByLevel() {
 #endif
 }
 
+#ifdef ROCKSDB_ML_PREDICT_PYTHON
 // PredictFileLifetimePythonByLevel is declared in tools/ml_predict_python.h
 double PredictFileLifetimePythonByLevel(const double* features,
                                         size_t feature_count, int level) {
-#ifdef ROCKSDB_ML_PREDICT_PYTHON
-  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 函数入口 (level=%d, features_count=%zu)\n", 
-          level, feature_count);
-  fflush(stderr);
-  
-  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 检查InitializePythonMLPredictor...\n");
-  fflush(stderr);
   bool init_ok = InitializePythonMLPredictor();
-  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: InitializePythonMLPredictor=%d, g_predict_func=%p\n", 
-          init_ok, (void*)g_predict_func);
-  fflush(stderr);
-  
   if (!init_ok || !g_predict_func) {
-    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: 初始化检查失败，返回0.0\n");
-    fflush(stderr);
     return 0.0;
   }
-  
-  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 初始化检查通过，继续执行\n");
-  fflush(stderr);
 
   int model_level = level;
   if (model_level < 1) {
-    fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: model_level < 1, 返回0.0\n");
-    fflush(stderr);
     return 0.0;
   }
   if (model_level > 6) {
-    fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: model_level > 6, 调整为6\n");
-    fflush(stderr);
     model_level = 6;
   }
 
-  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 准备获取GIL (model_level=%d)\n", model_level);
-  fflush(stderr);
-
   // CRITICAL: Acquire GIL for thread-safe Python calls
   // RocksDB compaction runs in background threads, so we must acquire GIL
-  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: 调用 PyGILState_Ensure()...\n");
-  fflush(stderr);
   PyGILState_STATE gstate = PyGILState_Ensure();
-  
-  fprintf(stderr, "[DEBUG] PredictFileLifetimePythonByLevel: PyGILState_Ensure() 返回，gstate=%d\n", (int)gstate);
-  fflush(stderr);
   
   PyObject* features_list = nullptr;
   PyObject* level_obj = nullptr;
   PyObject* args = nullptr;
   PyObject* result = nullptr;
   double predicted_lifetime = -1.0;
-
-  // 进程池日志已移除
 
   // Build features list
   features_list = PyList_New(feature_count);
@@ -4180,13 +3278,7 @@ double PredictFileLifetimePythonByLevel(const double* features,
   PyTuple_SetItem(args, 0, features_list);  // features first (matching Python function signature)
   PyTuple_SetItem(args, 1, level_obj);  // level second
 
-  fprintf(stderr, "[VERIFY] PredictFileLifetimePythonByLevel: 调用 PyObject_CallObject...\n");
-  fflush(stderr);
-  
   result = PyObject_CallObject(g_predict_func, args);
-  
-  fprintf(stderr, "[VERIFY] PredictFileLifetimePythonByLevel: PyObject_CallObject 返回: %p\n", (void*)result);
-  fflush(stderr);
   
   Py_DECREF(args);
 
@@ -4195,46 +3287,30 @@ double PredictFileLifetimePythonByLevel(const double* features,
     fflush(stderr);
     if (PyErr_Occurred()) {
       PyErr_Print();
-      // 清理错误状态，避免影响后续调用
       PyErr_Clear();
     }
     PyGILState_Release(gstate);
-    // 不要返回 0.0，返回一个负值表示失败
     return -1.0;
   }
 
-  fprintf(stderr, "[VERIFY] PredictFileLifetimePythonByLevel: Python调用成功，转换返回值...\n");
-  fflush(stderr);
-  
   predicted_lifetime = PyFloat_AsDouble(result);
   
-  // Check for Python error after conversion
   if (PyErr_Occurred()) {
     fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: 返回值转换时发生Python错误！\n");
     fflush(stderr);
     PyErr_Print();
-    // 清理错误状态，避免影响后续调用
     PyErr_Clear();
     Py_DECREF(result);
     PyGILState_Release(gstate);
     return -1.0;
   }
   
-  // 进程池日志已移除
-  
   Py_DECREF(result);
-  
-  // Release GIL before returning
   PyGILState_Release(gstate);
   
   return predicted_lifetime;
-#else
-  (void)features;
-  (void)feature_count;
-  (void)level;
-  return 0.0;
-#endif
 }
+#endif  // ROCKSDB_ML_PREDICT_PYTHON
 
 }  // namespace ROCKSDB_NAMESPACE
 

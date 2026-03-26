@@ -6,6 +6,8 @@
 # 设置是否启用二次写入（Phase 2）
 # 设置为 1 启用，设置为 0 或注释掉则禁用
 export ROCKSDB_ENABLE_PHASE2=1
+# Phase2=1 时必须同时设置：0=level-base，1=hash-base（未设置或非法值会导致 DB::Open 失败）
+export ROCKSDB_HASH_HANDLE="${ROCKSDB_HASH_HANDLE:-1}"
 
 # 设置ML模型目录路径
 # 如果未设置，将使用代码中的默认路径
@@ -20,6 +22,7 @@ echo "============================================"
 echo "RocksDB 运行配置"
 echo "============================================"
 echo "二次写入 (Phase 2): $([ "$ROCKSDB_ENABLE_PHASE2" == "1" ] && echo "启用" || echo "禁用")"
+echo "ROCKSDB_HASH_HANDLE: ${ROCKSDB_HASH_HANDLE} (0=level-base, 1=hash-base)"
 echo "模型目录: ${ROCKSDB_ML_MODELS_PATH:-<默认路径>}"
 echo "工具路径: ${ROCKSDB_TOOLS_PATH:-<默认路径>}"
 echo "============================================"

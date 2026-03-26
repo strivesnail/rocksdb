@@ -408,6 +408,16 @@ class Compaction {
 
   CompactionReason compaction_reason() const { return compaction_reason_; }
 
+  // When compaction is from normal path (not custom too-far), reason for not
+  // using custom: "level_zero", "use_custom_disabled", "no_too_far_files",
+  // "all_select_failed", "picker_not_custom", etc.
+  void set_normal_fallback_reason(const std::string& reason) {
+    normal_fallback_reason_ = reason;
+  }
+  const std::string& normal_fallback_reason() const {
+    return normal_fallback_reason_;
+  }
+
   const std::vector<FileMetaData*>& grandparents() const {
     return grandparents_;
   }
@@ -621,6 +631,10 @@ class Compaction {
 
   // Reason for compaction
   CompactionReason compaction_reason_;
+
+  // When this compaction is normal (not kLevelTooFarFiles), why custom was not
+  // used. Empty if not set.
+  std::string normal_fallback_reason_;
 
   // Notify on compaction completion only if listener was notified on compaction
   // begin.

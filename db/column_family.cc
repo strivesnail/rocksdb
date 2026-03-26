@@ -22,6 +22,8 @@
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_universal.h"
+#include "db/compaction/compaction_picker_custom.h"
+#include <cstdlib>
 #include "db/db_impl/db_impl.h"
 #include "db/internal_stats.h"
 #include "db/job_context.h"
@@ -663,8 +665,17 @@ ColumnFamilyData::ColumnFamilyData(
                                       db_session_id, blob_file_cache_.get()));
 
     if (ioptions_.compaction_style == kCompactionStyleLevel) {
-      compaction_picker_.reset(
-          new LevelCompactionPicker(ioptions_, &internal_comparator_));
+      const char* env_pred = std::getenv("ROCKSDB_ENABLE_PREDICTED_COMPACTION");
+      const char* env_phase2 = std::getenv("ROCKSDB_ENABLE_PHASE2");
+      bool use_custom = (env_pred != nullptr && std::string(env_pred) == "1") ||
+                        (env_phase2 != nullptr && std::string(env_phase2) == "1");
+      if (use_custom) {
+        compaction_picker_.reset(
+            new CustomCompactionPicker(ioptions_, &internal_comparator_));
+      } else {
+        compaction_picker_.reset(
+            new LevelCompactionPicker(ioptions_, &internal_comparator_));
+      }
     } else if (ioptions_.compaction_style == kCompactionStyleUniversal) {
       compaction_picker_.reset(
           new UniversalCompactionPicker(ioptions_, &internal_comparator_));

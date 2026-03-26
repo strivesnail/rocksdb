@@ -19,7 +19,11 @@
 namespace ROCKSDB_NAMESPACE {
 
 class CompactionOutputs;
-using CompactionFileOpenFunc = std::function<Status(CompactionOutputs&)>;
+// CompactionFileOpenFunc: 打开新的 compaction 输出文件
+// 参数：
+//   - CompactionOutputs&: 输出文件管理器
+//   - const Slice&: 文件的第一个 key（即 smallest，100% 精确）
+using CompactionFileOpenFunc = std::function<Status(CompactionOutputs&, const Slice&)>;
 using CompactionFileCloseFunc =
     std::function<Status(const Status&, const ParsedInternalKey&, const Slice&,
                          const CompactionIterator*, CompactionOutputs&)>;
@@ -32,16 +36,19 @@ class CompactionOutputs {
   struct Output {
     Output(FileMetaData&& _meta, const InternalKeyComparator& _icmp,
            bool _enable_hash, bool _finished, uint64_t precalculated_hash,
-           bool _is_proximal_level)
+           bool _is_proximal_level, bool _used_memory_buffer = false)
         : meta(std::move(_meta)),
           validator(_icmp, _enable_hash, precalculated_hash),
           finished(_finished),
-          is_proximal_level(_is_proximal_level) {}
+          is_proximal_level(_is_proximal_level),
+          used_memory_buffer(_used_memory_buffer) {}
     FileMetaData meta;
     OutputValidator validator;
     bool finished;
     bool is_proximal_level;
     std::shared_ptr<const TableProperties> table_properties;
+    // True if this output was opened with Phase2 memory buffer (two-phase write).
+    bool used_memory_buffer = false;
   };
 
   CompactionOutputs() = delete;
@@ -54,9 +61,11 @@ class CompactionOutputs {
   // Add generated output to the list
   void AddOutput(FileMetaData&& meta, const InternalKeyComparator& icmp,
                  bool enable_hash, bool finished = false,
-                 uint64_t precalculated_hash = 0) {
+                 uint64_t precalculated_hash = 0,
+                 bool used_memory_buffer = false) {
     outputs_.emplace_back(std::move(meta), icmp, enable_hash, finished,
-                          precalculated_hash, is_proximal_level_);
+                          precalculated_hash, is_proximal_level_,
+                          used_memory_buffer);
   }
 
   const std::vector<Output>& GetOutputs() const { return outputs_; }
@@ -180,6 +189,11 @@ class CompactionOutputs {
 
   FileMetaData* GetMetaData() { return &current_output().meta; }
 
+  // Whether the current output file was opened with Phase2 memory buffer.
+  bool CurrentOutputUsesMemoryBuffer() const {
+    return !outputs_.empty() && current_output().used_memory_buffer;
+  }
+
   bool HasOutput() const { return !outputs_.empty(); }
 
   uint64_t NumEntries() const { return builder_->NumEntries(); }
@@ -289,7 +303,10 @@ class CompactionOutputs {
     // over-approximate check for whether opening is needed.
     if (status.ok() && !HasBuilder() && !HasOutput() && range_del_agg &&
         !range_del_agg->IsEmpty()) {
-      status = open_file_func(*this);
+      // For range-del only files, we don't have a specific first key,
+      // pass an empty slice as the smallest key hint
+      const Slice empty_key{};
+      status = open_file_func(*this, empty_key);
     }
 
     if (HasBuilder()) {
@@ -312,6 +329,10 @@ class CompactionOutputs {
   // run in parallel however it should be much rarer.
   // It's caller's responsibility to make sure it's not empty.
   Output& current_output() {
+    assert(!outputs_.empty());
+    return outputs_.back();
+  }
+  const Output& current_output() const {
     assert(!outputs_.empty());
     return outputs_.back();
   }

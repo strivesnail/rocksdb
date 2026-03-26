@@ -91,6 +91,31 @@ class CompactionPicker {
 
   virtual bool NeedsCompaction(const VersionStorageInfo* vstorage) const = 0;
 
+  // Try to build a compaction from custom logic for the given level (e.g. too-far
+  // files). Called by LevelCompactionBuilder after level is chosen, before
+  // PickFileToCompact. Returns nullptr if no custom compaction; otherwise
+  // caller takes ownership of the returned Compaction*.
+  // When returning nullptr, optionally set *normal_reason to why: "use_custom_disabled",
+  // "no_too_far_files", "all_select_failed" (custom picker only).
+  virtual Compaction* TryCustomCompactionForLevel(
+      int start_level, int output_level, VersionStorageInfo* vstorage,
+      const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+      const MutableDBOptions& mutable_db_options, LogBuffer* log_buffer,
+      const std::string& full_history_ts_low, double start_level_score,
+      std::string* normal_reason = nullptr) {
+    (void)start_level;
+    (void)output_level;
+    (void)vstorage;
+    (void)cf_name;
+    (void)mutable_cf_options;
+    (void)mutable_db_options;
+    (void)log_buffer;
+    (void)full_history_ts_low;
+    (void)start_level_score;
+    (void)normal_reason;
+    return nullptr;
+  }
+
   // Sanitize the input set of compaction input files and convert it to
   // `std::vector<CompactionInputFiles>` in the output parameter
   // `converted_input_files`.

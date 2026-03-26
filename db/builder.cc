@@ -170,7 +170,7 @@ Status BuildTable(
             event_logger, ioptions.listeners, dbname,
             tboptions.column_family_name, fname, job_id, meta->fd,
             kInvalidBlobFileNumber, tp, tboptions.reason, s, file_checksum,
-            file_checksum_func_name);
+            file_checksum_func_name, 0);  // Flush操作，level通常是0
         return s;
       }
 
@@ -527,7 +527,7 @@ Status BuildTable(
       event_logger, ioptions.listeners, dbname, tboptions.column_family_name,
       fname, job_id, meta->fd, meta->oldest_blob_file_number, tp,
       tboptions.reason, status_for_listener, file_checksum,
-      file_checksum_func_name);
+      file_checksum_func_name, 0);  // Flush操作，level通常是0
 
   return s;
 }

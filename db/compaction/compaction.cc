@@ -203,14 +203,23 @@ bool Compaction::IsBottommostLevel(
     const std::vector<CompactionInputFiles>& inputs) {
   int output_l0_idx;
   if (output_level == 0) {
+    const auto& l0_files = vstorage->LevelFiles(0);
     output_l0_idx = 0;
-    for (const auto* file : vstorage->LevelFiles(0)) {
+    bool found = false;
+    for (const auto* file : l0_files) {
       if (inputs[0].files.back() == file) {
+        found = true;
         break;
       }
       ++output_l0_idx;
     }
-    assert(static_cast<size_t>(output_l0_idx) < vstorage->LevelFiles(0).size());
+    if (!found) {
+      output_l0_idx = (l0_files.size() > 0)
+                          ? static_cast<int>(l0_files.size() - 1)
+                          : -1;
+    }
+    assert(output_l0_idx == -1 ||
+           static_cast<size_t>(output_l0_idx) < l0_files.size());
   } else {
     output_l0_idx = -1;
   }

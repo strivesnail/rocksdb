@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "db/version_edit.h"
+#include "db/custom_compaction_pri_manager.h"
 #include "logging/log_buffer.h"
 #include "test_util/sync_point.h"
 
@@ -76,8 +77,10 @@ class LevelCompactionBuilder {
   Compaction* PickCompaction();
 
   // Pick the initial files to compact to the next level. (or together
-  // in Intra-L0 compactions)
-  void SetupInitialFiles();
+  // in Intra-L0 compactions). Returns non-null if custom compaction was
+  // chosen (caller takes ownership); otherwise returns nullptr and
+  // start_level_inputs_ may be filled by normal selection.
+  Compaction* SetupInitialFiles();
 
   // If the initial files are from L0 level, pick other L0
   // files if needed.
@@ -153,6 +156,10 @@ class LevelCompactionBuilder {
   CompactionInputFiles output_level_inputs_;
   std::vector<FileMetaData*> grandparents_;
   CompactionReason compaction_reason_ = CompactionReason::kUnknown;
+  // When we fall back to normal pick (TryCustomCompactionForLevel returned
+  // nullptr), reason for logging: level_zero, use_custom_disabled,
+  // no_too_far_files, all_select_failed, or empty if picker is not custom.
+  std::string last_fallback_reason_;
 
   const MutableCFOptions& mutable_cf_options_;
   const ImmutableOptions& ioptions_;
@@ -201,7 +208,7 @@ void LevelCompactionBuilder::PickFileToCompact(
   start_level_inputs_.files.clear();
 }
 
-void LevelCompactionBuilder::SetupInitialFiles() {
+Compaction* LevelCompactionBuilder::SetupInitialFiles() {
   // Find the compactions by size on all levels.
   bool skipped_l0_to_base = false;
   for (int i = 0; i < compaction_picker_->NumberLevels() - 1; i++) {
@@ -217,6 +224,19 @@ void LevelCompactionBuilder::SetupInitialFiles() {
       }
       output_level_ =
           (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
+      // Non-L0: try custom compaction (e.g. too-far files) before normal pick.
+      if (start_level_ != 0) {
+        last_fallback_reason_.clear();
+        Compaction* custom = compaction_picker_->TryCustomCompactionForLevel(
+            start_level_, output_level_, vstorage_, cf_name_,
+            mutable_cf_options_, mutable_db_options_, log_buffer_,
+            full_history_ts_low_, start_level_score_, &last_fallback_reason_);
+        if (custom != nullptr) {
+          return custom;
+        }
+      } else {
+        last_fallback_reason_ = "level_zero";
+      }
       bool picked_file_to_compact = PickFileToCompact();
       TEST_SYNC_POINT_CALLBACK("PostPickFileToCompact",
                                &picked_file_to_compact);
@@ -256,7 +276,7 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     }
   }
   if (!start_level_inputs_.empty()) {
-    return;
+    return nullptr;
   }
 
   // if we didn't find a compaction, check if there are any files marked for
@@ -270,7 +290,7 @@ void LevelCompactionBuilder::SetupInitialFiles() {
       });
   if (!start_level_inputs_.empty()) {
     compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
-    return;
+    return nullptr;
   }
 
   // Bottommost Files Compaction on deleting tombstones
@@ -278,25 +298,27 @@ void LevelCompactionBuilder::SetupInitialFiles() {
                     CompactToNextLevel::kNo);
   if (!start_level_inputs_.empty()) {
     compaction_reason_ = CompactionReason::kBottommostFiles;
-    return;
+    return nullptr;
   }
 
   // TTL Compaction
   if (ioptions_.compaction_pri == kRoundRobin &&
       !vstorage_->ExpiredTtlFiles().empty()) {
     auto expired_files = vstorage_->ExpiredTtlFiles();
-    // the expired files list should already be sorted by level
-    start_level_ = expired_files.front().first;
+    if (!expired_files.empty()) {
+      // the expired files list should already be sorted by level
+      start_level_ = expired_files.front().first;
 #ifndef NDEBUG
-    for (const auto& file : expired_files) {
-      assert(start_level_ <= file.first);
-    }
+      for (const auto& file : expired_files) {
+        assert(start_level_ <= file.first);
+      }
 #endif
-    if (start_level_ > 0) {
-      output_level_ = start_level_ + 1;
-      if (PickFileToCompact()) {
-        compaction_reason_ = CompactionReason::kRoundRobinTtl;
-        return;
+      if (start_level_ > 0) {
+        output_level_ = start_level_ + 1;
+        if (PickFileToCompact()) {
+          compaction_reason_ = CompactionReason::kRoundRobinTtl;
+          return nullptr;
+        }
       }
     }
   }
@@ -305,7 +327,7 @@ void LevelCompactionBuilder::SetupInitialFiles() {
                     CompactToNextLevel::kSkipLastLevel);
   if (!start_level_inputs_.empty()) {
     compaction_reason_ = CompactionReason::kTtl;
-    return;
+    return nullptr;
   }
 
   // Periodic Compaction
@@ -315,7 +337,7 @@ void LevelCompactionBuilder::SetupInitialFiles() {
                         : CompactToNextLevel::kNo);
   if (!start_level_inputs_.empty()) {
     compaction_reason_ = CompactionReason::kPeriodicCompaction;
-    return;
+    return nullptr;
   }
 
   // Forced blob garbage collection
@@ -323,8 +345,9 @@ void LevelCompactionBuilder::SetupInitialFiles() {
                     CompactToNextLevel::kNo);
   if (!start_level_inputs_.empty()) {
     compaction_reason_ = CompactionReason::kForcedBlobGC;
-    return;
+    return nullptr;
   }
+  return nullptr;
 }
 
 bool LevelCompactionBuilder::SetupOtherL0FilesIfNeeded() {
@@ -511,8 +534,11 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
 
 Compaction* LevelCompactionBuilder::PickCompaction() {
   // Pick up the first file to start compaction. It may have been extended
-  // to a clean cut.
-  SetupInitialFiles();
+  // to a clean cut. SetupInitialFiles may return a custom compaction.
+  Compaction* custom = SetupInitialFiles();
+  if (custom != nullptr) {
+    return custom;
+  }
   if (start_level_inputs_.empty()) {
     return nullptr;
   }
@@ -532,6 +558,9 @@ Compaction* LevelCompactionBuilder::PickCompaction() {
 
   // Form a compaction object containing the files we picked.
   Compaction* c = GetCompaction();
+  if (c != nullptr && !last_fallback_reason_.empty()) {
+    c->set_normal_fallback_reason(last_fallback_reason_);
+  }
 
   TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
 
@@ -874,10 +903,20 @@ bool LevelCompactionBuilder::PickFileToCompact() {
     vstorage_->GetOverlappingInputs(output_level_, &smallest, &largest,
                                     &output_level_inputs.files);
     if (output_level_inputs.empty()) {
+      // 检测trivial move：如果使用了自定义pri，需要标记
+      // 注意：trivial move的重写逻辑在PerformTrivialMove中处理
+      if (start_level_ > 0 && CustomCompactionPriManager::IsEnabled() && 
+          g_custom_compaction_pri_manager != nullptr) {
+        bool used_custom_pri = g_custom_compaction_pri_manager->ShouldUseCustomPri(start_level_);
+        (void)used_custom_pri;  // 抑制未使用警告，trivial move重写逻辑在PerformTrivialMove中处理
+      }
+      
       if (start_level_ > 0 &&
           TryExtendNonL0TrivialMove(index,
                                     ioptions_.compaction_pri ==
                                         kRoundRobin /* only_expand_right */)) {
+        // Trivial move检测成功，如果使用了自定义pri，这里可以添加标记逻辑
+        // 注意：trivial move的重写逻辑在PerformTrivialMove中处理
         break;
       }
     } else {

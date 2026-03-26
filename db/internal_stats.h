@@ -223,6 +223,9 @@ class InternalStats {
     // Number of compactions done
     int count;
 
+    // Cumulative number of files moved via trivial move to this level
+    int num_trivial_move_files;
+
     // Number of compactions done per CompactionReason
     int counts[static_cast<int>(CompactionReason::kNumOfReasons)]{};
 
@@ -247,7 +250,8 @@ class InternalStats {
           num_input_records(0),
           num_dropped_records(0),
           num_output_records(0),
-          count(0) {
+          count(0),
+          num_trivial_move_files(0) {
       int num_of_reasons = static_cast<int>(CompactionReason::kNumOfReasons);
       for (int i = 0; i < num_of_reasons; i++) {
         counts[i] = 0;
@@ -275,7 +279,8 @@ class InternalStats {
           num_input_records(0),
           num_dropped_records(0),
           num_output_records(0),
-          count(c) {
+          count(c),
+          num_trivial_move_files(0) {
       int num_of_reasons = static_cast<int>(CompactionReason::kNumOfReasons);
       for (int i = 0; i < num_of_reasons; i++) {
         counts[i] = 0;
@@ -312,7 +317,8 @@ class InternalStats {
           num_input_records(c.num_input_records),
           num_dropped_records(c.num_dropped_records),
           num_output_records(c.num_output_records),
-          count(c.count) {
+          count(c.count),
+          num_trivial_move_files(c.num_trivial_move_files) {
       int num_of_reasons = static_cast<int>(CompactionReason::kNumOfReasons);
       for (int i = 0; i < num_of_reasons; i++) {
         counts[i] = c.counts[i];
@@ -344,6 +350,7 @@ class InternalStats {
       num_dropped_records = c.num_dropped_records;
       num_output_records = c.num_output_records;
       count = c.count;
+      num_trivial_move_files = c.num_trivial_move_files;
 
       int num_of_reasons = static_cast<int>(CompactionReason::kNumOfReasons);
       for (int i = 0; i < num_of_reasons; i++) {
@@ -374,6 +381,7 @@ class InternalStats {
       this->num_dropped_records = 0;
       this->num_output_records = 0;
       this->count = 0;
+      this->num_trivial_move_files = 0;
       int num_of_reasons = static_cast<int>(CompactionReason::kNumOfReasons);
       for (int i = 0; i < num_of_reasons; i++) {
         counts[i] = 0;
@@ -407,6 +415,7 @@ class InternalStats {
       this->num_dropped_records += c.num_dropped_records;
       this->num_output_records += c.num_output_records;
       this->count += c.count;
+      this->num_trivial_move_files += c.num_trivial_move_files;
       int num_of_reasons = static_cast<int>(CompactionReason::kNumOfReasons);
       for (int i = 0; i < num_of_reasons; i++) {
         counts[i] += c.counts[i];
@@ -440,6 +449,7 @@ class InternalStats {
       this->num_dropped_records -= c.num_dropped_records;
       this->num_output_records -= c.num_output_records;
       this->count -= c.count;
+      this->num_trivial_move_files -= c.num_trivial_move_files;
       int num_of_reasons = static_cast<int>(CompactionReason::kNumOfReasons);
       for (int i = 0; i < num_of_reasons; i++) {
         counts[i] -= c.counts[i];
@@ -582,6 +592,10 @@ class InternalStats {
 
   void IncBytesMoved(int level, uint64_t amount) {
     comp_stats_[level].bytes_moved += amount;
+  }
+
+  void IncTrivialMoveCount(int level, int moved_files) {
+    comp_stats_[level].num_trivial_move_files += moved_files;
   }
 
   void AddCFStats(InternalCFStatsType type, uint64_t value) {

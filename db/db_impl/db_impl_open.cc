@@ -13,6 +13,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/two_phase_write_manager.h"
+#include "db/custom_compaction_pri_manager.h"
 #include "db/periodic_task_scheduler.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
@@ -2707,52 +2708,48 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                            std::string(enable_phase2_env) == "1");
       
       // Read model directory from environment variable ROCKSDB_ML_MODELS_PATH
-      // If not set, use default path
+      // If not set, use default path (69-feature models)
       const char* model_dir_env = std::getenv("ROCKSDB_ML_MODELS_PATH");
       std::string model_dir = model_dir_env ? 
                              std::string(model_dir_env) :
-                             "/home/usr/test_environment/workplace/log/experiment_logs/new_log/run_batch_20260131_063807/backup_old_data_models/models_balanced";
+                             "/home/usr/test_environment/workplace/models_69_features";
       
       // Database path
       std::string db_path = impl->dbname_;
       
       // Initialize TwoPhaseWriteManager - NO ERROR TOLERANCE, FAIL IMMEDIATELY ON ERROR
-      fprintf(stderr, "[DBImpl::Open] [VERIFY] Starting TwoPhaseWriteManager initialization...\n");
-      fprintf(stderr, "[DBImpl::Open] [VERIFY]   enable_phase2=%d\n", enable_phase2 ? 1 : 0);
-      fprintf(stderr, "[DBImpl::Open] [VERIFY]   model_dir=%s\n", model_dir.c_str());
-      fprintf(stderr, "[DBImpl::Open] [VERIFY]   db_path=%s\n", db_path.c_str());
-      fflush(stderr);
       
       impl->two_phase_write_manager_ = std::make_unique<TwoPhaseWriteManager>();
       Status init_status = impl->two_phase_write_manager_->Initialize(
-          model_dir, db_path, enable_phase2);
+          model_dir, db_path, enable_phase2, impl->immutable_db_options_.info_log.get());
       
       // NO ERROR TOLERANCE - FAIL IMMEDIATELY
       if (!init_status.ok()) {
-        fprintf(stderr, "[DBImpl::Open] [FATAL] TwoPhaseWriteManager initialization FAILED: %s\n",
-                init_status.ToString().c_str());
-        fflush(stderr);
-        ROCKS_LOG_ERROR(impl->immutable_db_options_.info_log,
-                        "[FATAL] TwoPhaseWriteManager initialization FAILED: %s",
+        ROCKS_LOG_FATAL(impl->immutable_db_options_.info_log,
+                        "[DBImpl::Open] TwoPhaseWriteManager initialization FAILED: %s",
                         init_status.ToString().c_str());
         // FAIL IMMEDIATELY - NO FALLBACK
         s = init_status;
       } else {
         // Set global singleton (for access from compaction_job.cc and event_helpers.cc)
         g_two_phase_write_manager = impl->two_phase_write_manager_.get();
-        
-        fprintf(stderr, "[DBImpl::Open] [VERIFY] ✓ TwoPhaseWriteManager initialized successfully\n");
-        fprintf(stderr, "[DBImpl::Open] [VERIFY]   enable_phase2=%d\n", enable_phase2 ? 1 : 0);
-        fprintf(stderr, "[DBImpl::Open] [VERIFY]   model_dir=%s\n", model_dir.c_str());
-        fprintf(stderr, "[DBImpl::Open] [VERIFY]   db_path=%s\n", db_path.c_str());
-        fprintf(stderr, "[DBImpl::Open] [VERIFY]   global singleton set: %p\n", (void*)g_two_phase_write_manager);
-        fflush(stderr);
-        
-        if (impl->immutable_db_options_.info_log) {
-          ROCKS_LOG_INFO(impl->immutable_db_options_.info_log,
-                         "[VERIFY] TwoPhaseWriteManager initialized: enable_phase2=%d, model_dir=%s, db_path=%s",
-                         enable_phase2 ? 1 : 0, model_dir.c_str(), db_path.c_str());
+      }
+      
+      // Initialize CustomCompactionPriManager if enabled
+      if (CustomCompactionPriManager::IsEnabled()) {
+        int num_levels = 7;
+        if (!handles->empty()) {
+          auto* handle_impl = static_cast<ColumnFamilyHandleImpl*>(handles->front());
+          if (handle_impl) {
+            auto* cfd = handle_impl->cfd();
+            if (cfd) {
+              num_levels = cfd->ioptions().num_levels;
+            }
+          }
         }
+        impl->custom_compaction_pri_manager_ = std::make_unique<CustomCompactionPriManager>();
+        impl->custom_compaction_pri_manager_->Initialize(num_levels, impl->immutable_db_options_.info_log.get());
+        g_custom_compaction_pri_manager = impl->custom_compaction_pri_manager_.get();
       }
     }
     

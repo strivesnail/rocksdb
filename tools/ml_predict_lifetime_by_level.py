@@ -40,16 +40,36 @@ class FileLifetimePredictorByLevel:
         self.scalers = {}  # level -> scaler
         self.configs = {}  # level -> config
         self.lazy_load = lazy_load
+        self._subset_n_features = None  # When set, C++ passes N-dim subset; do not apply selected_features
+
+        # Load feature subset config if present (from export_feature_importance_and_subset.py)
+        for name in ('feature_subset.json', 'feature_subset.txt'):
+            path = self.models_base_path / name
+            if path.exists():
+                try:
+                    if name.endswith('.json'):
+                        with open(path, 'r') as f:
+                            data = json.load(f)
+                        self._subset_n_features = data.get('n_features')
+                    else:
+                        with open(path, 'r') as f:
+                            line = f.readline()
+                            if line.strip().isdigit():
+                                self._subset_n_features = int(line.strip())
+                except Exception:
+                    pass
+                if self._subset_n_features is not None:
+                    break
         
         # Load models for all levels (unless lazy_load is True)
         if not lazy_load:
             self._load_all_models()
     
     def _load_all_models(self):
-        """Load models for all levels"""
+        """Load models for levels 1-5 (Level 0 → handle 6, Level 6 → handle 12; Level 1-5 use predicted lifetime → handle 7-11)
+        """
         # Try simple format first (model_level_{level}_lgb.txt + scaler_level_{level}.pkl)
-        # This is the format used by train_models_by_level.py
-        for level in range(1, 7):
+        for level in range(1, 6):
             model_loaded = False
             
             # Try simple format: model_level_{level}_lgb.txt or model_level_{level}_xgb.json
@@ -124,7 +144,7 @@ class FileLifetimePredictorByLevel:
                         except Exception:
                             pass
                     
-                    # Create simple config
+                    # Create simple config (n_features: when set, input is already N-dim subset from C++)
                     config = {
                         'model_type': model_type,
                         'test_r2': test_r2,
@@ -132,6 +152,8 @@ class FileLifetimePredictorByLevel:
                         'use_log_transform': False,
                         'selected_features': None
                     }
+                    if self._subset_n_features is not None:
+                        config['n_features'] = self._subset_n_features
                     
                     self.models[level] = model
                     self.scalers[level] = scaler
@@ -309,6 +331,7 @@ class FileLifetimePredictorByLevel:
         lgb_model_file = self.models_base_path / f"model_level_{level}_lgb.txt"
         xgb_model_file = self.models_base_path / f"model_level_{level}_xgb.json"
         scaler_file = self.models_base_path / f"scaler_level_{level}.pkl"
+        sklearn_exts = ('rf', 'et', 'gb', 'hgb')
         
         model_type = None
         model = None
@@ -327,6 +350,14 @@ class FileLifetimePredictorByLevel:
                 model.load_model(str(xgb_model_file))
             else:
                 raise RuntimeError(f"XGBoost not available, cannot load model for Level {level}")
+        else:
+            for ext in sklearn_exts:
+                pkl_file = self.models_base_path / f"model_level_{level}_{ext}.pkl"
+                if pkl_file.exists():
+                    with open(pkl_file, 'rb') as f:
+                        model = pickle.load(f)
+                    model_type = ext
+                    break
         
         if model_type:
             # Load scaler
@@ -347,13 +378,16 @@ class FileLifetimePredictorByLevel:
                         raise ValueError(f"Scaler file for Level {level} does not contain a valid scaler object")
             
             # Load config (use default if not found)
+            # sklearn models (rf/et/gb/hgb) and our LGB/XGB are trained with log(1+y), so use_log_transform=True
             config = {
                 'model_type': model_type,
                 'preprocessing': 'standard' if scaler else 'none',
-                'use_log_transform': False,
+                'use_log_transform': True,
                 'use_feature_interactions': False,
                 'selected_features': None
             }
+            if self._subset_n_features is not None:
+                config['n_features'] = self._subset_n_features
             
             self.models[level] = model
             self.scalers[level] = scaler
@@ -369,8 +403,12 @@ class FileLifetimePredictorByLevel:
         Predict file lifetime from features for a specific level
         
         Args:
-            features: numpy array of 69 features
-            level: target level (1-6)
+            features: numpy array of 35 features (reduced from 69)
+            level: target level (2-5). 
+                   Level 0/1/6 files are directly mapped to handles without ML prediction:
+                   - Level 0 -> handle 6
+                   - Level 1 -> handle 7 (skip feature calculation for performance)
+                   - Level 6 -> handle 12
             
         Returns:
             predicted lifetime in seconds (float)
@@ -392,11 +430,15 @@ class FileLifetimePredictorByLevel:
         # Convert to numpy array if needed
         features = np.array(features, dtype=np.float64)
         
-        # Apply feature selection BEFORE preprocessing (matching training order)
-        # In training: feature selection -> scaling -> model
-        selected_features = config.get('selected_features')
-        if selected_features:
-            features = self._apply_feature_selection(features, selected_features)
+        # When C++ passes N-dim subset (feature_subset.json), input is already in subset order; skip selection
+        n_features = config.get('n_features')
+        if n_features is not None and len(features) == n_features:
+            pass  # use features as-is
+        else:
+            # Apply feature selection BEFORE preprocessing (matching training order)
+            selected_features = config.get('selected_features')
+            if selected_features:
+                features = self._apply_feature_selection(features, selected_features)
         
         # Apply preprocessing (scaling)
         # If scaler is None or not in dict, skip preprocessing (use raw features)
@@ -521,6 +563,9 @@ def initialize():
         # No process pool, use direct call
         _use_process_pool = False
         predictor = get_predictor()
+        # With lazy_load=True, models are not loaded at init; load them now for initialize() check
+        if predictor and predictor.lazy_load and len(predictor.models) == 0:
+            predictor._load_all_models()
         if predictor and len(predictor.models) > 0:
             return True
         # Expose the problem - no models loaded
@@ -531,8 +576,13 @@ def predict_file_lifetime_by_level(features, level):
     Predict file lifetime (called from C++)
     
     Args:
-        features: numpy array of 69 features
-        level: target level (1-6)
+        features: list/array of features. When feature_subset.json exists in model dir,
+                  C++ passes N-dim subset (len(features)==N); otherwise 69-dim.
+        level: target level (2-5). 
+               Level 0/1/6 files are directly mapped to handles without ML prediction:
+               - Level 0 -> handle 6
+               - Level 1 -> handle 7 (skip feature calculation for performance)
+               - Level 6 -> handle 12
     
     Returns:
         predicted lifetime in seconds (float)
@@ -567,11 +617,17 @@ if __name__ == '__main__':
     # Test the predictor
     predictor = FileLifetimePredictorByLevel()
     
-    # Create dummy features (69 features)
-    dummy_features = np.random.rand(69)
+    # Create dummy features (35 features, reduced from 69)
+    dummy_features = np.random.rand(35)
     
-    # Test prediction for each level
-    for level in range(1, 7):
+    # Test prediction for each level (2-5 only)
+    # Level 0/1/6 are directly mapped to handles without ML prediction
+    print("Note: Level 0/1/6 are directly mapped to handles without ML prediction")
+    print("  Level 0 -> handle 6")
+    print("  Level 1 -> handle 7 (skip feature calculation)")
+    print("  Level 6 -> handle 12")
+    print()
+    for level in range(1, 6):
         lifetime = predictor.predict(dummy_features, level)
         print(f"Level {level}: Predicted lifetime = {lifetime:.2f} seconds")
 

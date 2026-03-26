@@ -10,9 +10,12 @@
 #include <deque>
 
 #include "db/builder.h"
+#include "db/custom_compaction_pri_manager.h"
+#include "db/two_phase_write_manager.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "file/filename.h"
 #include "file/file_util.h"
 #include "file/sst_file_manager_impl.h"
 #include "logging/logging.h"
@@ -1437,6 +1440,11 @@ Status DBImpl::PerformTrivialMove(Compaction& c, LogBuffer* log_buffer,
                    c.column_family_data()->GetName().c_str(),
                    static_cast<int>(c.num_input_files(0)), c.output_level());
 
+  Status s_rewrite = TryRewriteTooFarFilesOnTrivialMove(c, log_buffer);
+  if (!s_rewrite.ok()) {
+    return s_rewrite;
+  }
+
   // Move files to the output level by editing the manifest
   for (unsigned int l = 0; l < c.num_input_levels(); l++) {
     if (c.level(l) == c.output_level()) {
@@ -1477,6 +1485,152 @@ Status DBImpl::PerformTrivialMove(Compaction& c, LogBuffer* log_buffer,
       });
 
   return status;
+}
+
+Status DBImpl::TryRewriteTooFarFilesOnTrivialMove(Compaction& c,
+                                                  LogBuffer* log_buffer) {
+  const char* env =
+      std::getenv("ROCKSDB_TRIVIAL_MOVE_REWRITE");
+  if (env == nullptr || std::string(env) != "1") {
+    return Status::OK();
+  }
+  if (two_phase_write_manager_ == nullptr) {
+    return Status::OK();
+  }
+  ROCKS_LOG_BUFFER(log_buffer,
+                   "[%s] Trivial move rewrite enabled, checking too-far files "
+                   "for level-%d\n",
+                   c.column_family_data()->GetName().c_str(), c.start_level());
+  for (unsigned int l = 0; l < c.num_input_levels(); l++) {
+    if (c.level(l) == c.output_level()) {
+      continue;
+    }
+    for (size_t i = 0; i < c.num_input_files(l); i++) {
+      FileMetaData* f = c.input(l, i);
+      uint64_t file_number = f->fd.GetNumber();
+      if (!two_phase_write_manager_->IsFileTooFar(file_number)) {
+        continue;
+      }
+      std::string file_path = TableFileName(
+          c.immutable_options().cf_paths, file_number, f->fd.GetPathId());
+      std::string temp_file_path = file_path + ".tmp";
+      int output_handle =
+          two_phase_write_manager_->GetTargetHandleForCompactionOutputMetadata(
+              file_number, static_cast<int>(c.output_level()));
+      Env::WriteLifeTimeHint hint = (output_handle >= 6 && output_handle <= 12)
+          ? static_cast<Env::WriteLifeTimeHint>(output_handle)
+          : Env::WLTH_NOT_SET;
+      Status rewrite_status = RewriteFileAtomically(
+          file_path, temp_file_path, f->fd.GetFileSize(), hint);
+      if (!rewrite_status.ok()) {
+        ROCKS_LOG_BUFFER(log_buffer,
+                         "[%s] Failed to rewrite file #%" PRIu64
+                         " during trivial move: %s\n",
+                         c.column_family_data()->GetName().c_str(),
+                         file_number, rewrite_status.ToString().c_str());
+        return rewrite_status;
+      }
+      two_phase_write_manager_->RegisterFileMetadata(
+          file_number, static_cast<int>(c.output_level()), output_handle,
+          f->fd.GetFileSize());
+      ROCKS_LOG_BUFFER(log_buffer,
+                       "[%s] Rewrote file #%" PRIu64
+                       " atomically during trivial move (too-far)\n",
+                       c.column_family_data()->GetName().c_str(), file_number);
+    }
+  }
+  return Status::OK();
+}
+
+Status DBImpl::RewriteFileAtomically(const std::string& source_path,
+                                     const std::string& temp_path,
+                                     uint64_t expected_size,
+                                     Env::WriteLifeTimeHint write_hint) {
+  mutex_.AssertHeld();
+  
+  FileSystem* fs = immutable_db_options_.fs.get();
+  const IOOptions io_options;
+  IODebugContext* dbg = nullptr;
+  
+  // Open source file for reading
+  std::unique_ptr<FSRandomAccessFile> source_file;
+  Status s = fs->NewRandomAccessFile(source_path, FileOptions(), &source_file, dbg);
+  if (!s.ok()) {
+    return s;
+  }
+  
+  // Open temp file for writing（使用目标 level 的 handle 以便底层按冷热放置）
+  FileOptions write_opts;
+  write_opts.write_hint = write_hint;
+  std::unique_ptr<FSWritableFile> temp_file;
+  s = fs->NewWritableFile(temp_path, write_opts, &temp_file, dbg);
+  if (!s.ok()) {
+    return s;
+  }
+  
+  // Read and write in chunks to avoid loading entire file into memory
+  const size_t chunk_size = 64 * 1024;  // 64KB chunks
+  std::unique_ptr<char[]> buffer(new char[chunk_size]);
+  uint64_t total_read = 0;
+  uint64_t total_written = 0;
+  
+  while (total_read < expected_size) {
+    size_t to_read = static_cast<size_t>(
+        std::min(static_cast<uint64_t>(chunk_size), expected_size - total_read));
+    
+    Slice result;
+    s = source_file->Read(total_read, to_read, io_options, &result, 
+                          buffer.get(), dbg);
+    if (!s.ok()) {
+      temp_file->Close(IOOptions(), dbg);
+      fs->DeleteFile(temp_path, IOOptions(), dbg);
+      return s;
+    }
+    
+    if (result.size() == 0) {
+      break;  // EOF
+    }
+    
+    s = temp_file->Append(result, io_options, dbg);
+    if (!s.ok()) {
+      temp_file->Close(IOOptions(), dbg);
+      fs->DeleteFile(temp_path, IOOptions(), dbg);
+      return s;
+    }
+    
+    total_read += result.size();
+    total_written += result.size();
+  }
+  
+  // Verify file size
+  if (total_written != expected_size) {
+    temp_file->Close(IOOptions(), dbg);
+    fs->DeleteFile(temp_path, IOOptions(), dbg);
+    return Status::Corruption("File size mismatch during rewrite");
+  }
+  
+  // Sync and close temp file
+  s = temp_file->Sync(io_options, dbg);
+  if (!s.ok()) {
+    temp_file->Close(IOOptions(), dbg);
+    fs->DeleteFile(temp_path, IOOptions(), dbg);
+    return s;
+  }
+  
+  s = temp_file->Close(IOOptions(), dbg);
+  if (!s.ok()) {
+    fs->DeleteFile(temp_path, IOOptions(), dbg);
+    return s;
+  }
+  
+  // Atomically replace source file with temp file
+  s = fs->RenameFile(temp_path, source_path, IOOptions(), dbg);
+  if (!s.ok()) {
+    fs->DeleteFile(temp_path, IOOptions(), dbg);
+    return s;
+  }
+  
+  return Status::OK();
 }
 
 Status DBImpl::CompactFilesImpl(
@@ -1607,6 +1761,12 @@ Status DBImpl::CompactFilesImpl(
           log_buffer,
           "[%s] Trivial move succeeded for %zu files, %zu bytes total\n",
           c->column_family_data()->GetName().c_str(), moved_files, moved_bytes);
+      
+      // Update CustomCompactionPriManager state after trivial move completes
+      if (status.ok() && CustomCompactionPriManager::IsEnabled() &&
+          g_custom_compaction_pri_manager != nullptr && c != nullptr) {
+        g_custom_compaction_pri_manager->IncrementCompactionCount(c->start_level());
+      }
     } else {
       if (!compaction_released) {
         c->ReleaseCompactionFiles(status);
@@ -4277,7 +4437,8 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
                             compaction_job_stats, job_context->job_id);
 
-    if (c->compaction_reason() == CompactionReason::kLevelMaxLevelSize &&
+    if ((c->compaction_reason() == CompactionReason::kLevelMaxLevelSize ||
+         c->compaction_reason() == CompactionReason::kLevelTooFarFiles) &&
         c->immutable_options().compaction_pri == kRoundRobin) {
       int start_level = c->start_level();
       if (start_level > 0) {
@@ -4293,24 +4454,46 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     size_t moved_bytes = 0;
     status = PerformTrivialMove(*c.get(), log_buffer, compaction_released,
                                 moved_files, moved_bytes);
-    io_s = versions_->io_status();
+      io_s = versions_->io_status();
     InstallSuperVersionAndScheduleWork(
         c->column_family_data(), job_context->superversion_contexts.data());
 
-    VersionStorageInfo::LevelSummaryStorage tmp;
-    c->column_family_data()->internal_stats()->IncBytesMoved(c->output_level(),
-                                                             moved_bytes);
-    {
-      event_logger_.LogToBuffer(log_buffer)
-          << "job" << job_context->job_id << "event" << "trivial_move"
-          << "destination_level" << c->output_level() << "files" << moved_files
-          << "total_files_size" << moved_bytes;
+    ColumnFamilyData* cfd_trivial = c->column_family_data();
+    if (cfd_trivial) {
+      cfd_trivial->internal_stats()->IncBytesMoved(c->output_level(),
+                                                   moved_bytes);
+      for (unsigned int l = 0; l < c->num_input_levels(); l++) {
+        if (c->level(l) == c->output_level()) continue;
+        int num_files = static_cast<int>(c->num_input_files(l));
+        if (num_files > 0) {
+          cfd_trivial->internal_stats()->IncTrivialMoveCount(c->level(l),
+                                                            num_files);
+        }
+      }
     }
+    {
+      auto stream = event_logger_.LogToBuffer(log_buffer);
+      stream << "job" << job_context->job_id << "event" << "trivial_move"
+             << "destination_level" << c->output_level() << "files" << moved_files
+             << "total_files_size" << moved_bytes;
+      stream << "input_files";
+      stream.StartArray();
+      for (unsigned int l = 0; l < c->num_input_levels(); ++l) {
+        if (c->level(l) == c->output_level()) continue;
+        for (size_t i = 0; i < c->num_input_files(l); ++i) {
+          auto* f = c->input(l, i);
+          if (f) stream << f->fd.GetNumber();
+        }
+      }
+      stream.EndArray();
+    }
+    Version* cur = cfd_trivial->current();
+    VersionStorageInfo::LevelSummaryStorage tmp;
     ROCKS_LOG_BUFFER(
         log_buffer, "[%s] Moved #%d files to level-%zu %zu bytes %s: %s\n",
-        c->column_family_data()->GetName().c_str(), moved_files,
+        cfd_trivial->GetName().c_str(), static_cast<int>(moved_files),
         c->output_level(), moved_bytes, status.ToString().c_str(),
-        c->column_family_data()->current()->storage_info()->LevelSummary(&tmp));
+        cur->storage_info()->LevelSummary(&tmp));
     *made_progress = true;
 
     // Clear Instrument
@@ -4832,16 +5015,17 @@ void DBImpl::InstallSuperVersionAndScheduleWork(
   // triggered soon anyway.
   bottommost_files_mark_threshold_ = kMaxSequenceNumber;
   standalone_range_deletion_files_mark_threshold_ = kMaxSequenceNumber;
+  Version* cfd_current = cfd->current();
   for (auto* my_cfd : *versions_->GetColumnFamilySet()) {
+    Version* v = my_cfd->current();
     if (!my_cfd->AllowIngestBehind()) {
       bottommost_files_mark_threshold_ = std::min(
           bottommost_files_mark_threshold_,
-          my_cfd->current()->storage_info()->bottommost_files_mark_threshold());
+          v->storage_info()->bottommost_files_mark_threshold());
     }
     standalone_range_deletion_files_mark_threshold_ =
         std::min(standalone_range_deletion_files_mark_threshold_,
-                 cfd->current()
-                     ->storage_info()
+                 cfd_current->storage_info()
                      ->standalone_range_tombstone_files_mark_threshold());
   }
 

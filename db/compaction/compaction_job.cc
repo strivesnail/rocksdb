@@ -10,6 +10,7 @@
 #include "db/compaction/compaction_job.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <memory>
 #include <optional>
@@ -30,6 +31,13 @@
 #include "db/event_helpers_ml_features.h"
 #include "db/history_trimming_iterator.h"
 #include "db/two_phase_write_manager.h"
+#ifdef ROCKSDB_ML_PREDICT_PYTHON
+#include "tools/ml_predict_python.h"
+#endif
+#ifdef ROCKSDB_ML_PREDICT_ONNX
+#include "db/onnx_predictor.h"
+#endif
+#include "db/custom_compaction_pri_manager.h"
 #include "db/log_writer.h"
 #include "db/merge_helper.h"
 #include "db/range_del_aggregator.h"
@@ -106,6 +114,8 @@ const char* GetCompactionReasonString(CompactionReason compaction_reason) {
       return "RoundRobinTtl";
     case CompactionReason::kRefitLevel:
       return "RefitLevel";
+    case CompactionReason::kLevelTooFarFiles:
+      return "LevelTooFarFiles";
     case CompactionReason::kNumOfReasons:
       // fall through
     default:
@@ -711,12 +721,17 @@ void CompactionJob::InitializeCompactionRun() {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_RUN);
   TEST_SYNC_POINT("CompactionJob::Run():Start");
-  log_buffer_->FlushBufferToLog();
+  if (log_buffer_) {
+    log_buffer_->FlushBufferToLog();
+  }
   LogCompaction();
 }
 
 void CompactionJob::RunSubcompactions() {
   TEST_SYNC_POINT("CompactionJob::RunSubcompactions:BeforeStart");
+  if (!compact_ || !compact_->compaction) {
+    return;
+  }
   const size_t num_threads = compact_->sub_compact_states.size();
   assert(num_threads > 0);
   compact_->compaction->GetOrInitInputTableProperties();
@@ -1068,8 +1083,33 @@ void CompactionJob::FinalizeCompactionRun(
 Status CompactionJob::Run() {
   InitializeCompactionRun();
 
-  const uint64_t start_micros = db_options_.clock->NowMicros();
+  // [COMPACT_INPUT] 日志：本次 compaction 的输入文件及其存活时间（便于排查长生命周期）
+  if (db_options_.info_log && g_two_phase_write_manager != nullptr && compact_ && compact_->compaction) {
+    Compaction* c = compact_->compaction;
+    const size_t num_levels = c->num_input_levels();
+    const uint64_t now_micros = db_options_.clock ? db_options_.clock->NowMicros() : 0;
+    const double current_time_seconds = static_cast<double>(now_micros) / 1e6;
+    for (size_t compaction_input_level = 0; compaction_input_level < num_levels; ++compaction_input_level) {
+      const size_t num_files = c->num_input_files(compaction_input_level);
+      const int file_level = c->level(compaction_input_level);
+      for (size_t i = 0; i < num_files; ++i) {
+        FileMetaData* f = c->input(compaction_input_level, i);
+        if (!f) continue;
+        uint64_t file_num = f->fd.GetNumber();
+        uint64_t creation_time = f->TryGetFileCreationTime();
+        double elapsed = 0.0;
+        if (creation_time != 0) {
+          elapsed = current_time_seconds - static_cast<double>(creation_time);
+        }
+        int handle = g_two_phase_write_manager->GetFileTargetHandle(file_num);
+        ROCKS_LOG_INFO(db_options_.info_log,
+                "[COMPACT_INPUT] file_num=%" PRIu64 " level=%d handle=%d elapsed=%.1fs creation_time=%" PRIu64,
+                file_num, file_level, handle, elapsed, creation_time);
+      }
+    }
+  }
 
+  const uint64_t start_micros = db_options_.clock ? db_options_.clock->NowMicros() : 0;
   RunSubcompactions();
 
   UpdateTimingStats(start_micros);
@@ -1222,7 +1262,13 @@ Status CompactionJob::Install(bool* compaction_released) {
       "CompactionJob::Install:AfterUpdateCompactionJobStats", job_stats_);
 
   auto stream = event_logger_->LogToBuffer(log_buffer_, 8192);
+  const char* compaction_type =
+      (compact_->compaction->compaction_reason() ==
+       CompactionReason::kLevelTooFarFiles)
+          ? "custom"
+          : "normal";
   stream << "job" << job_id_ << "event" << "compaction_finished"
+         << "compaction_type" << compaction_type
          << "compaction_time_micros" << stats.micros
          << "compaction_time_cpu_micros" << stats.cpu_micros << "output_level"
          << compact_->compaction->output_level() << "num_output_files"
@@ -1281,7 +1327,16 @@ Status CompactionJob::Install(bool* compaction_released) {
            << pl_stats.bytes_written_blob;
   }
 
+  // Update CustomCompactionPriManager state after compaction completes
+  if (status.ok() && CustomCompactionPriManager::IsEnabled() &&
+      g_custom_compaction_pri_manager != nullptr && compact_ != nullptr &&
+      compact_->compaction != nullptr) {
+    g_custom_compaction_pri_manager->IncrementCompactionCount(
+        compact_->compaction->start_level());
+  }
+
   CleanupCompaction();
+  
   return status;
 }
 
@@ -1551,8 +1606,8 @@ std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>
 CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
                                   SubcompactionKeyBoundaries& boundaries) {
   const CompactionFileOpenFunc open_file_func =
-      [this, sub_compact](CompactionOutputs& outputs) {
-        return this->OpenCompactionOutputFile(sub_compact, outputs);
+      [this, sub_compact](CompactionOutputs& outputs, const Slice& first_key) {
+        return this->OpenCompactionOutputFile(sub_compact, outputs, first_key);
       };
 
   const Slice* start_user_key =
@@ -1818,8 +1873,12 @@ Status CompactionJob::FinalizeBlobFiles(SubcompactionState* sub_compact,
 
 void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   TEST_SYNC_POINT("CompactionJob::ProcessKeyValueCompaction:Start");
-  assert(sub_compact);
-  assert(sub_compact->compaction);
+  if (!sub_compact || !sub_compact->compaction) {
+    return;
+  }
+  if (!compact_ || !compact_->compaction) {
+    return;
+  }
 
   if (!ShouldUseLocalCompaction(sub_compact)) {
     return;
@@ -1828,10 +1887,14 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
 
-  const uint64_t start_cpu_micros = db_options_.clock->CPUMicros();
+  const uint64_t start_cpu_micros = db_options_.clock ? db_options_.clock->CPUMicros() : 0;
   uint64_t prev_cpu_micros = start_cpu_micros;
   const CompactionIOStatsSnapshot io_stats = InitializeIOStats();
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
+  if (!cfd) {
+    sub_compact->status = Status::Corruption("cfd is null in ProcessKeyValueCompaction");
+    return;
+  }
   const CompactionFilter* compaction_filter;
   std::unique_ptr<CompactionFilter> compaction_filter_from_factory = nullptr;
   Status filter_status = SetupAndValidateCompactionFilter(
@@ -1853,7 +1916,10 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   InternalIterator* input_iter = CreateInputIterator(
       sub_compact, cfd, iterators, boundaries, read_options);
 
-  assert(input_iter);
+  if (!input_iter) {
+    sub_compact->status = Status::Corruption("CreateInputIterator returned null");
+    return;
+  }
 
   Status status =
       MaybeResumeSubcompactionProgressOnInputIterator(sub_compact, input_iter);
@@ -1897,7 +1963,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
                         start_cpu_micros, prev_cpu_micros, io_stats);
 
   NotifyOnSubcompactionCompleted(sub_compact);
-}
+} 
 
 void CompactionJob::FinalizeSubcompaction(
     SubcompactionState* sub_compact, Status status,
@@ -2025,6 +2091,9 @@ Status CompactionJob::FinishCompactionOutputFile(
 
   const uint64_t current_entries = outputs.NumEntries();
 
+  // 记录写入开始时间
+  uint64_t t_write_start = db_options_.clock->NowMicros();
+
   s = outputs.Finish(s, seqno_to_time_mapping_);
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::FinishCompactionOutputFile()::AfterFinish", &s);
@@ -2053,6 +2122,15 @@ Status CompactionJob::FinishCompactionOutputFile(
   // Finish and check for file errors
   IOStatus io_s = outputs.WriterSyncClose(s, db_options_.clock, stats_,
                                           db_options_.use_fsync);
+  
+  // 记录写入结束时间
+  uint64_t t_write_end = db_options_.clock->NowMicros();
+  uint64_t write_time_us = t_write_end - t_write_start;
+  
+  // 输出写入时间日志
+  ROCKS_LOG_INFO(db_options_.info_log,
+      "[TIMING_WRITE] file #%" PRIu64 " WriteToDisk=%" PRIu64 "us, size=%" PRIu64 " bytes",
+      output_number, write_time_us, meta->fd.GetFileSize());
 
   if (s.ok() && io_s.ok()) {
     file_checksum = meta->file_checksum;
@@ -2073,12 +2151,81 @@ Status CompactionJob::FinishCompactionOutputFile(
   if (s.ok()) {
     tp = outputs.GetTableProperties();
   }
+
+  // Phase2 二次写入：buffer 已写完，用真实 key range 算特征、解耦函数取 handle、注册、重写
+  if (s.ok() && io_s.ok() && outputs.CurrentOutputUsesMemoryBuffer() &&
+      g_two_phase_write_manager && g_two_phase_write_manager->IsInitialized() &&
+      g_two_phase_write_manager->IsPhase2Enabled()) {
+    int output_level = sub_compact->compaction->output_level();
+    if (output_level >= 1 && output_level <= 6 && meta->smallest.size() > 0 &&
+        meta->largest.size() > 0 &&
+        (current_entries > 0 || tp.num_range_deletions > 0)) {
+      MLFeatures features;
+      bool features_ok = CalculateMLFeaturesBeforeWrite(
+          meta->smallest, meta->largest, current_entries, meta->fd.GetFileSize(),
+          output_level, cfd, &features, db_mutex_, nullptr);
+      if (features_ok) {
+        std::vector<double> feature_array(69);
+        MLFeaturesToArray(features, feature_array.data(), feature_array.size());
+        LogMLFeaturesForCollection(output_number, output_level, meta->smallest,
+                                   meta->largest, current_entries,
+                                   meta->fd.GetFileSize(), cfd);
+        int target_handle =
+            GetTargetHandleForCompactionOutput(output_number, output_level,
+                                              feature_array.data(),
+                                              feature_array.size());
+        g_two_phase_write_manager->RegisterFileMetadata(
+            output_number, output_level, target_handle,
+            static_cast<uint64_t>(meta->fd.GetFileSize()));
+        g_two_phase_write_manager->MaybeDoPhase2Rewrite(output_number);
+      }
+    } else if (output_level == 6 &&
+               (current_entries > 0 || tp.num_range_deletions > 0)) {
+      int target_handle =
+          g_two_phase_write_manager->GetTargetHandleForCompactionOutputMetadata(
+              output_number, 6);
+      g_two_phase_write_manager->RegisterFileMetadata(
+          output_number, 6, target_handle,
+          static_cast<uint64_t>(meta->fd.GetFileSize()));
+      g_two_phase_write_manager->MaybeDoPhase2Rewrite(output_number);
+    }
+  }
+
+  // 直接写路径：若开启特征收集则打 [ML_FEATURES]（独立于预测/元数据注册，由 ROCKSDB_COLLECT_FEATURES 或 ROCKSDB_ML_COLLECT_ONLY 控制）
+  if (s.ok() && io_s.ok() && !outputs.CurrentOutputUsesMemoryBuffer() &&
+      g_two_phase_write_manager && g_two_phase_write_manager->IsInitialized() &&
+      g_two_phase_write_manager->IsPhase2Enabled()) {
+    int output_level = sub_compact->compaction->output_level();
+    if (output_level >= 1 && output_level <= 6 &&
+        meta->smallest.size() > 0 && meta->largest.size() > 0 &&
+        (current_entries > 0 || tp.num_range_deletions > 0)) {
+      LogMLFeaturesForCollection(output_number, output_level, meta->smallest,
+                                meta->largest, current_entries,
+                                meta->fd.GetFileSize(), cfd);
+    }
+  }
+  // 直接写路径：解耦封装，仅注册 compaction 输出元数据（由 ROCKSDB_PHASE2_REGISTER_METADATA 控制）
+  if (s.ok() && io_s.ok() && !outputs.CurrentOutputUsesMemoryBuffer() &&
+      g_two_phase_write_manager && g_two_phase_write_manager->IsInitialized() &&
+      g_two_phase_write_manager->IsPhase2Enabled()) {
+    int output_level = sub_compact->compaction->output_level();
+    if (output_level >= 1 && output_level <= 6 &&
+        (current_entries > 0 || tp.num_range_deletions > 0)) {
+      g_two_phase_write_manager->MaybeRegisterCompactionOutputMetadata(
+          output_number, output_level,
+          static_cast<uint64_t>(meta->fd.GetFileSize()));
+    }
+  }
+
   if (s.ok() && current_entries == 0 && tp.num_range_deletions == 0) {
     // If there is nothing to output, no necessary to generate a sst file.
     // This happens when the output level is bottom level, at the same time
     // the sub_compact output nothing.
     std::string fname = GetTableFileName(meta->fd.GetNumber());
 
+    if (outputs.CurrentOutputUsesMemoryBuffer() && g_two_phase_write_manager) {
+      g_two_phase_write_manager->ReleaseMemoryBuffer(output_number);
+    }
     // TODO(AR) it is not clear if there are any larger implications if
     // DeleteFile fails here
     Status ds = env_->DeleteFile(fname);
@@ -2122,109 +2269,12 @@ Status CompactionJob::FinishCompactionOutputFile(
       status_for_listener = Status::Aborted("Empty SST file not kept");
     }
   }
+  int output_level = sub_compact->compaction->output_level();
   EventHelpers::LogAndNotifyTableFileCreationFinished(
       event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(), fname,
       job_id_, output_fd, oldest_blob_file_number, tp,
       TableFileCreationReason::kCompaction, status_for_listener, file_checksum,
-      file_checksum_func_name);
-
-  // ML-driven two-phase write: collect features, predict, and rewrite if needed
-  // This must be done BEFORE OnAddFile to ensure file is at target path
-  if (s.ok() && meta != nullptr) {
-    int output_level = sub_compact->compaction->output_level();
-    
-    // Check environment variable first - this is the source of truth
-    const char* enable_phase2_env = std::getenv("ROCKSDB_ENABLE_PHASE2");
-    bool enable_phase2_from_env = (enable_phase2_env != nullptr && 
-                                    std::string(enable_phase2_env) == "1");
-    
-    TwoPhaseWriteManager* local_manager = g_two_phase_write_manager;
-    
-    // 只在Phase2启用时记录日志
-    if (enable_phase2_from_env && output_level > 0) {
-      fprintf(stderr, "[VERIFY] FinishCompactionOutputFile: file #%" PRIu64 " level=%d\n", output_number, output_level);
-      fflush(stderr);
-    }
-    
-    bool use_temp_output = false;
-    
-    // Check if we used temp output by checking if memory buffer exists
-    // This is more reliable than re-checking conditions, as it reflects what actually happened
-    // But we also check environment variable to ensure consistency
-    if (enable_phase2_from_env && output_level > 0 && 
-        local_manager && local_manager->IsInitialized() && 
-        local_manager->IsPhase2Enabled()) {
-      // Check if memory buffer actually exists (was created in OpenCompactionOutputFile)
-      std::string test_buffer;
-      Status buffer_check = local_manager->GetMemoryBufferData(output_number, &test_buffer);
-      if (buffer_check.ok()) {
-        use_temp_output = true;
-      } else {
-        use_temp_output = false;
-      }
-    } else {
-      use_temp_output = false;
-    }
-    
-    // Only calculate features and predict if Phase 2 is enabled by environment variable
-    // Skip Level 0 - CalculateMLFeatures returns false for Level 0 by design
-    if (enable_phase2_from_env && output_level > 0 && 
-        local_manager && local_manager->IsInitialized() && 
-        local_manager->IsPhase2Enabled()) {
-      // Calculate ML features - NO ERROR TOLERANCE
-      uint64_t file_size_for_features = meta->fd.file_size;
-      if (file_size_for_features == 0) {
-        TableProperties tp_fallback = outputs.GetTableProperties();
-        if (tp_fallback.raw_key_size > 0 || tp_fallback.raw_value_size > 0) {
-          file_size_for_features = tp_fallback.data_size;
-        }
-      }
-      
-      MLFeatures features;
-      
-      bool features_ok = CalculateMLFeatures(
-          meta->fd, meta->smallest, meta->largest,
-          file_size_for_features, current_entries,
-          output_level, cfd, &features, db_mutex_);
-      
-      // NO ERROR TOLERANCE - features calculation must succeed (for levels > 0)
-      if (!features_ok) {
-        fprintf(stderr, "[FATAL] FinishCompactionOutputFile: file #%" PRIu64 " - CalculateMLFeatures failed! This is a fatal error!\n", output_number);
-        fprintf(stderr, "[FATAL] Possible reasons:\n");
-        fprintf(stderr, "  1. cfd is nullptr\n");
-        fprintf(stderr, "  2. compaction_pri != kMinOverlappingRatio\n");
-        fprintf(stderr, "  3. keys are unset\n");
-        fflush(stderr);
-        abort();  // FAIL IMMEDIATELY
-      }
-      
-      // Convert MLFeatures to 69-element double array
-      std::vector<double> features_array(69);
-      MLFeaturesToArray(features, features_array.data(), features_array.size());
-      
-      // Collect features and predict - NO ERROR TOLERANCE
-      Status predict_status = local_manager->CollectFeaturesAndPredict(
-          output_number, output_level, features_array);
-      
-      if (!predict_status.ok()) {
-        fprintf(stderr, "[FATAL] FinishCompactionOutputFile: file #%" PRIu64 " - CollectFeaturesAndPredict failed: %s\n",
-                output_number, predict_status.ToString().c_str());
-        fflush(stderr);
-        abort();  // FAIL IMMEDIATELY
-      }
-      
-      // If prediction succeeded and we used temp output, rewrite from memory buffer to target handle
-      if (use_temp_output) {
-        Status rewrite_status = local_manager->RewriteFileToTargetHandle(output_number);
-        if (!rewrite_status.ok()) {
-          fprintf(stderr, "[FATAL] FinishCompactionOutputFile: file #%" PRIu64 " - RewriteFileToTargetHandle failed: %s\n",
-                  output_number, rewrite_status.ToString().c_str());
-          fflush(stderr);
-          abort();  // FAIL IMMEDIATELY
-        }
-      }
-    }
-  }
+      file_checksum_func_name, output_level);
 
   // Report new file to SstFileManagerImpl
   auto sfm =
@@ -2338,16 +2388,125 @@ bool CompactionJob::ShouldUpdateSubcompactionProgress(
   return true;
 }
 
+int CompactionJob::GetTargetHandleForCompactionOutput(
+    uint64_t file_number, int output_level, const double* feature_array,
+    size_t feature_len) {
+  const char* collect_only = std::getenv("ROCKSDB_ML_COLLECT_ONLY");
+  auto log_compaction_handle_fallback = [&](const char* reason) {
+    if (!db_options_.info_log) {
+      return;
+    }
+    static std::atomic<uint64_t> fallback_count{0};
+    uint64_t n = fallback_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 48u || (n % 256u) == 0u) {
+      ROCKS_LOG_WARN(
+          db_options_.info_log.get(),
+          "[FALLBACK][CompactionJob] GetTargetHandleForCompactionOutput "
+          "file #%" PRIu64 " level=%d: %s (log count %" PRIu64 ")",
+          file_number, output_level, reason,
+          static_cast<uint64_t>(n));
+    }
+  };
+
+  if (collect_only != nullptr && std::string(collect_only) == "1") {
+    if (g_two_phase_write_manager &&
+        g_two_phase_write_manager->IsPhase2Enabled() &&
+        output_level >= 1 && output_level <= 6) {
+      return g_two_phase_write_manager->GetTargetHandleForCompactionOutputMetadata(
+          file_number, output_level);
+    }
+    log_compaction_handle_fallback(
+        "ROCKSDB_ML_COLLECT_ONLY=1 but Phase2 off or level not in [1,6]: "
+        "LevelToHandle");
+    return TwoPhaseWriteManager::LevelToHandle(output_level);
+  }
+  const char* ml_predict = std::getenv("ROCKSDB_ML_PREDICT");
+  if (ml_predict == nullptr || std::string(ml_predict) != "1") {
+    if (g_two_phase_write_manager &&
+        g_two_phase_write_manager->IsPhase2Enabled() &&
+        output_level >= 1 && output_level <= 6) {
+      return g_two_phase_write_manager->GetTargetHandleForCompactionOutputMetadata(
+          file_number, output_level);
+    }
+    log_compaction_handle_fallback(
+        "ROCKSDB_ML_PREDICT!=1 and Phase2 off or level not in [1,6]: "
+        "LevelToHandle");
+    return TwoPhaseWriteManager::LevelToHandle(output_level);
+  }
+#if defined(ROCKSDB_ML_PREDICT_PYTHON) || defined(ROCKSDB_ML_PREDICT_ONNX)
+  double predicted_lifetime = -1.0;
+#if defined(ROCKSDB_ML_PREDICT_PYTHON)
+  predicted_lifetime =
+      PredictFileLifetimePythonByLevel(feature_array, feature_len, output_level);
+#elif defined(ROCKSDB_ML_PREDICT_ONNX)
+  predicted_lifetime =
+      PredictFileLifetimeONNX(feature_array, feature_len, output_level);
+#endif
+  if (predicted_lifetime >= 0 && g_two_phase_write_manager) {
+    return g_two_phase_write_manager->MapLifetimeToHandle(predicted_lifetime,
+                                                          output_level);
+  }
+  log_compaction_handle_fallback(
+      "ML prediction < 0 or two_phase_manager null; using metadata / "
+      "LevelToHandle");
+#else
+  log_compaction_handle_fallback(
+      "ROCKSDB_ML_PREDICT=1 but no ML backend compiled; using metadata / "
+      "LevelToHandle");
+#endif
+  if (g_two_phase_write_manager &&
+      g_two_phase_write_manager->IsPhase2Enabled() &&
+      output_level >= 1 && output_level <= 6) {
+    return g_two_phase_write_manager->GetTargetHandleForCompactionOutputMetadata(
+        file_number, output_level);
+  }
+  log_compaction_handle_fallback(
+      "Phase2 off or level not in [1,6] after ML fallback: LevelToHandle");
+  return TwoPhaseWriteManager::LevelToHandle(output_level);
+}
+
+void CompactionJob::LogMLFeaturesForCollection(
+    uint64_t file_number, int output_level, const InternalKey& smallest,
+    const InternalKey& largest, uint64_t current_entries, uint64_t file_size,
+    ColumnFamilyData* cfd) {
+  const char* collect = std::getenv("ROCKSDB_COLLECT_FEATURES");
+  const char* collect_only = std::getenv("ROCKSDB_ML_COLLECT_ONLY");
+  bool do_collect = (collect != nullptr && std::string(collect) == "1") ||
+                    (collect_only != nullptr && std::string(collect_only) == "1");
+  if (!do_collect) {
+    return;
+  }
+  MLFeatures features;
+  bool features_ok = CalculateMLFeaturesBeforeWrite(
+      smallest, largest, current_entries, file_size, output_level, cfd,
+      &features, db_mutex_, nullptr);
+  if (!features_ok) {
+    return;
+  }
+  std::vector<double> feature_array(69);
+  MLFeaturesToArray(features, feature_array.data(), feature_array.size());
+  std::string buf;
+  for (size_t i = 0; i < 69; ++i) {
+    if (i > 0) buf += ",";
+    char tmp[32];
+    snprintf(tmp, sizeof(tmp), "%.6g", feature_array[i]);
+    buf += tmp;
+  }
+  ROCKS_LOG_INFO(db_options_.info_log,
+                 "[ML_FEATURES] file #%" PRIu64 " level=%d 69dims=[%s]",
+                 file_number, output_level, buf.c_str());
+}
+
 Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
   assert(compact_);
 
   db_mutex_->AssertHeld();
 
-  const ReadOptions read_options(Env::IOActivity::kCompaction);
-  const WriteOptions write_options(Env::IOActivity::kCompaction);
-
   auto* compaction = compact_->compaction;
   assert(compaction);
+
+  const ReadOptions read_options(Env::IOActivity::kCompaction);
+  const WriteOptions write_options(Env::IOActivity::kCompaction);
 
   {
     Compaction::InputLevelSummaryBuffer inputs_summary;
@@ -2411,7 +2570,8 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
 
   if ((compaction->compaction_reason() ==
            CompactionReason::kLevelMaxLevelSize ||
-       compaction->compaction_reason() == CompactionReason::kRoundRobinTtl) &&
+       compaction->compaction_reason() == CompactionReason::kRoundRobinTtl ||
+       compaction->compaction_reason() == CompactionReason::kLevelTooFarFiles) &&
       compaction->immutable_options().compaction_pri == kRoundRobin) {
     int start_level = compaction->start_level();
     if (start_level > 0) {
@@ -2458,7 +2618,9 @@ void CompactionJob::RecordCompactionIOStats() {
 }
 
 Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
-                                               CompactionOutputs& outputs) {
+                                               CompactionOutputs& outputs,
+                                               const Slice& first_key) {
+  (void)first_key;  // Phase2 buffer 路径在 Finish 时用 meta smallest/largest
   assert(sub_compact != nullptr);
 
   // no need to lock because VersionSet::next_file_number_ is atomic
@@ -2479,31 +2641,9 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
   
   // Try to get manager from global variable, but don't rely on it
   TwoPhaseWriteManager* local_manager = g_two_phase_write_manager;
-  
-  // 只在Phase2启用且manager可用时记录日志
-  if (enable_phase2_from_env && local_manager && local_manager->IsInitialized() && local_manager->IsPhase2Enabled()) {
-    fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: file #%" PRIu64 " level=%d\n", file_number, output_level);
-    fflush(stderr);
-  }
-  
-  bool use_temp_output = false;
-  
-  // Use environment variable as primary check, manager as secondary
-  // If environment variable says Phase2 is enabled, we should use memory buffer
-  // But we still need manager to be initialized to actually create the buffer
-  if (enable_phase2_from_env && output_level > 0) {
-    // Phase2 is enabled by environment variable, but we need manager to be available
-    if (local_manager && local_manager->IsInitialized() && 
-        local_manager->IsPhase2Enabled()) {
-      use_temp_output = local_manager->HandleFileCreation(file_number, output_level, fname);
-      
-      if (use_temp_output) {
-        fprintf(stderr, "[VERIFY] OpenCompactionOutputFile: file #%" PRIu64 " - Using memory buffer\n", file_number);
-        fflush(stderr);
-      }
-    }
-  }
-  
+  (void)enable_phase2_from_env;
+  (void)local_manager;
+
   // Fire events.
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
   EventHelpers::NotifyTableFileCreationStarted(
@@ -2524,31 +2664,36 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
   fo_copy.temperature = temperature;
   fo_copy.write_hint = write_hint_;
 
+  // Phase2 二次写入：由 ROCKSDB_PHASE2_USE_BUFFER=1 控制是否走 memory buffer，否则直接写文件
+  bool use_memory_buffer = false;
+  const char* use_buf_env = std::getenv("ROCKSDB_PHASE2_USE_BUFFER");
+  if (use_buf_env != nullptr && std::string(use_buf_env) == "1" &&
+      enable_phase2_from_env && local_manager &&
+      local_manager->IsInitialized() && local_manager->IsPhase2Enabled() &&
+      local_manager->HandleFileCreation(file_number, output_level, fname)) {
+    writable_file = local_manager->CreateMemoryWritableFile(file_number);
+    if (writable_file) {
+      use_memory_buffer = true;
+    } else {
+      ROCKS_LOG_WARN(db_options_.info_log,
+                     "[JOB %d] file #%" PRIu64
+                     " CreateMemoryWritableFile failed, fallback to direct write",
+                     job_id_, file_number);
+      local_manager->ReleaseMemoryBuffer(file_number);  // 回退：释放已创建的 buffer
+    }
+  }
+
   Status s;
   IOStatus io_s;
-  
-  // Check if we should use memory buffer
-  if (use_temp_output && local_manager && local_manager->IsInitialized() && local_manager->IsPhase2Enabled()) {
-    
-    // Note: CreateMemoryBuffer was already called in HandleFileCreation above,
-    // so we don't need to call it again here.
-    
-    // Create memory writable file that writes directly to memory buffer
-    writable_file = local_manager->CreateMemoryWritableFile(file_number);
-    if (!writable_file) {
-      fprintf(stderr, "[FATAL] OpenCompactionOutputFile: file #%" PRIu64 " - Failed to create memory writable file\n", file_number);
-      fflush(stderr);
-      return Status::Corruption("Failed to create memory writable file");
-    }
-    s = Status::OK();
-    io_s = IOStatus::OK();
-  } else {
+  if (!use_memory_buffer) {
     io_s = NewWritableFile(fs_.get(), fname, &writable_file, fo_copy);
     s = io_s;
+  } else {
+    s = Status::OK();
+    io_s = IOStatus::OK();
   }
   
-  if (io_s.ok()) {
-    // Track the SST file path for cleanup on abort.
+  if (s.ok() && io_s.ok()) {
     outputs.AddOutputFilePath(fname);
   }
   if (sub_compact->io_status.ok()) {
@@ -2565,11 +2710,12 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
         sub_compact->compaction->column_family_data()->GetName().c_str(),
         job_id_, file_number, s.ToString().c_str());
     LogFlush(db_options_.info_log);
+    // output_level 已在函数开头声明（第2500行），这里直接使用
     EventHelpers::LogAndNotifyTableFileCreationFinished(
         event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
         fname, job_id_, FileDescriptor(), kInvalidBlobFileNumber,
         TableProperties(), TableFileCreationReason::kCompaction, s,
-        kUnknownFileChecksum, kUnknownFileChecksumFuncName);
+        kUnknownFileChecksum, kUnknownFileChecksumFuncName, output_level);
     return s;
   }
 
@@ -2628,7 +2774,8 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
     }
 
     outputs.AddOutput(std::move(meta), cfd->internal_comparator(),
-                      paranoid_file_checks_);
+                      paranoid_file_checks_, false /* finished */,
+                      0 /* precalculated_hash */, use_memory_buffer);
   }
 
   writable_file->SetIOPriority(GetRateLimiterPriority());
@@ -2867,8 +3014,14 @@ void CompactionJob::UpdateCompactionJobOutputStatsFromInternalStats(
 }
 
 void CompactionJob::LogCompaction() {
+  if (!compact_ || !compact_->compaction) {
+    return;
+  }
   Compaction* compaction = compact_->compaction;
   ColumnFamilyData* cfd = compaction->column_family_data();
+  if (!cfd) {
+    return;
+  }
   // Let's check if anything will get logged. Don't prepare all the info if
   // we're not logging
   if (db_options_.info_log_level <= InfoLogLevel::INFO_LEVEL) {
@@ -2881,7 +3034,24 @@ void CompactionJob::LogCompaction() {
     compaction->Summary(scratch, sizeof(scratch));
     ROCKS_LOG_INFO(db_options_.info_log, "[%s]: Compaction start summary: %s\n",
                    cfd->GetName().c_str(), scratch);
+    if (compaction->compaction_reason() == CompactionReason::kLevelTooFarFiles) {
+      ROCKS_LOG_INFO(db_options_.info_log, "[%s] [JOB %d] [COMPACTION_SOURCE] custom",
+                     cfd->GetName().c_str(), job_id_);
+    } else {
+      const std::string& reason = compaction->normal_fallback_reason();
+      if (reason.empty()) {
+        ROCKS_LOG_INFO(db_options_.info_log, "[%s] [JOB %d] [COMPACTION_SOURCE] normal",
+                       cfd->GetName().c_str(), job_id_);
+      } else {
+        ROCKS_LOG_INFO(db_options_.info_log,
+                       "[%s] [JOB %d] [COMPACTION_SOURCE] normal (reason: %s)",
+                       cfd->GetName().c_str(), job_id_, reason.c_str());
+      }
+    }
     // build event logger report
+    if (!event_logger_) {
+      return;
+    }
     auto stream = event_logger_->Log();
     stream << "job" << job_id_ << "event" << "compaction_started" << "cf_name"
            << cfd->GetName() << "compaction_reason"
@@ -2889,8 +3059,11 @@ void CompactionJob::LogCompaction() {
     for (size_t i = 0; i < compaction->num_input_levels(); ++i) {
       stream << ("files_L" + std::to_string(compaction->level(i)));
       stream.StartArray();
-      for (auto f : *compaction->inputs(i)) {
-        stream << f->fd.GetNumber();
+      const std::vector<FileMetaData*>* input_files = compaction->inputs(i);
+      if (input_files) {
+        for (auto f : *input_files) {
+          if (f) stream << f->fd.GetNumber();
+        }
       }
       stream.EndArray();
     }

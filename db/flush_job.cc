@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <vector>
 
 #include "db/builder.h"
@@ -25,6 +26,7 @@
 #include "db/range_tombstone_fragmenter.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
+#include "db/two_phase_write_manager.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "logging/event_logger.h"
@@ -865,8 +867,14 @@ Status FlushJob::WriteLevel0Table() {
   InternalStats::CompactionStats flush_stats(CompactionReason::kFlush,
                                              1 /* count**/);
   {
+    const char* enable_phase2_env = std::getenv("ROCKSDB_ENABLE_PHASE2");
+    bool phase2_enabled =
+        (enable_phase2_env != nullptr && std::string(enable_phase2_env) == "1");
     auto write_hint = base_->storage_info()->CalculateSSTWriteHint(
         /*level=*/0, db_options_.calculate_sst_write_lifetime_hint_set);
+    if (phase2_enabled) {
+      write_hint = static_cast<Env::WriteLifeTimeHint>(6);  // L0 -> handle 6
+    }
     Env::IOPriority io_priority = GetRateLimiterPriority();
     db_mutex_->Unlock();
     if (log_buffer_) {
@@ -1010,6 +1018,17 @@ Status FlushJob::WriteLevel0Table() {
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();
+      if (s.ok() && phase2_enabled) {
+        if (g_two_phase_write_manager &&
+            g_two_phase_write_manager->IsInitialized() &&
+            g_two_phase_write_manager->IsPhase2Enabled()) {
+          g_two_phase_write_manager->RegisterFileMetadata(
+              meta_.fd.GetNumber(), 0, 6, meta_.fd.GetFileSize());
+          ROCKS_LOG_INFO(db_options_.info_log,
+                         "[FILE_HANDLE] file #%" PRIu64 " level=0 -> handle 6 (flush)",
+                         meta_.fd.GetNumber());
+        }
+      }
       if (s.ok() && total_num_input_entries != flush_stats.num_input_records) {
         std::string msg = "Expected " +
                           std::to_string(total_num_input_entries) +

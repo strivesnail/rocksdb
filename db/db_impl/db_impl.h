@@ -84,6 +84,7 @@ class VersionEdit;
 class VersionSet;
 class WriteCallback;
 class TwoPhaseWriteManager;
+class CustomCompactionPriManager;
 struct JobContext;
 struct ExternalSstFileInfo;
 struct MemTableInfo;
@@ -1420,6 +1421,7 @@ class DBImpl : public DB {
 
   // Two-phase write manager for ML-driven compaction
   std::unique_ptr<TwoPhaseWriteManager> two_phase_write_manager_;
+  std::unique_ptr<CustomCompactionPriManager> custom_compaction_pri_manager_;
 
   // only used for dynamically adjusting max_total_wal_size. it is a sum of
   // [write_buffer_size * max_write_buffer_number] over all column families
@@ -2415,6 +2417,20 @@ class DBImpl : public DB {
   Status PerformTrivialMove(Compaction& c, LogBuffer* log_buffer,
                             bool& compaction_released, size_t& moved_files,
                             size_t& moved_bytes);
+
+  // Helper function to rewrite a file atomically (read from source, write to temp, then rename)
+  // Used when custom compaction pri was used but file is being trivial moved
+  // write_hint: handle for the destination level (trivial move 目标 level)，用于写 temp 文件时下发
+  // REQUIRES: mutex held
+  // Returns: Status of the rewrite operation
+  Status RewriteFileAtomically(const std::string& source_path,
+                               const std::string& temp_path,
+                               uint64_t expected_size,
+                               Env::WriteLifeTimeHint write_hint = Env::WLTH_NOT_SET);
+
+  // 解耦：trivial move 时对 too-far 文件按目标 handle 重写。由 ROCKSDB_TRIVIAL_MOVE_REWRITE=1 独立控制。
+  // REQUIRES: mutex held
+  Status TryRewriteTooFarFilesOnTrivialMove(Compaction& c, LogBuffer* log_buffer);
 
   // REQUIRES: mutex unlocked
   void TrackOrUntrackFiles(const std::vector<std::string>& existing_data_files,

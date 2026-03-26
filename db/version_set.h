@@ -348,6 +348,13 @@ class VersionStorageInfo {
     return files_[level];
   }
 
+  // Compute overlapping bytes between [file_smallest, file_largest] and files
+  // in other_level. Uses same logic as SortFileByOverlappingRatio for
+  // kMinOverlappingRatio consistency.
+  uint64_t ComputeOverlappingBytesWithLevel(
+      const InternalKey& file_smallest, const InternalKey& file_largest,
+      int other_level, const InternalKeyComparator& icmp) const;
+
   bool HasMissingEpochNumber() const;
   uint64_t GetMaxEpochNumberOfFiles() const;
   EpochNumberRequirement GetEpochNumberRequirement() const {
@@ -714,6 +721,10 @@ class VersionStorageInfo {
   // size. The file with the largest size is at the front.
   // This vector stores the index of the file from files_.
   std::vector<std::vector<int>> files_by_compaction_pri_;
+
+  // Records whether custom compaction pri was actually used (without fallback)
+  // for each level. Set in UpdateFilesByCompactionPri when custom pri is used.
+  std::vector<bool> used_custom_pri_for_level_;
 
   // If true, means that files in L0 have keys with non overlapping ranges
   bool level0_non_overlapping_;

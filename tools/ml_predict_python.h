@@ -18,8 +18,8 @@ namespace ROCKSDB_NAMESPACE {
 bool InitializeMLPredictorByLevel();
 
 // Predict file lifetime using Python ML model
-// features: array of feature values (69 features)
-// feature_count: number of features (should be 69)
+// features: array of feature values (35 features, reduced from 69)
+// feature_count: number of features (should be 35)
 // level: file level (1-6)
 // Returns predicted lifetime in seconds, or 0.0 on error
 double PredictFileLifetimePythonByLevel(const double* features,

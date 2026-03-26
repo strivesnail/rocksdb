@@ -9,6 +9,7 @@
 #include "db/db_impl/db_impl.h"
 
 #include "db/two_phase_write_manager.h"
+#include "db/custom_compaction_pri_manager.h"
 
 #include <cstdint>
 #ifdef OS_SOLARIS
@@ -720,22 +721,6 @@ Status DBImpl::CloseHelper() {
 Status DBImpl::CloseImpl() { return CloseHelper(); }
 
 DBImpl::~DBImpl() {
-  // Shutdown TwoPhaseWriteManager
-  if (two_phase_write_manager_) {
-    two_phase_write_manager_->Shutdown();
-    // Clear global singleton ONLY if it matches this instance
-    // This prevents clearing the global variable if a new DB instance has already been opened
-    if (g_two_phase_write_manager == two_phase_write_manager_.get()) {
-      fprintf(stderr, "[DBImpl::~DBImpl] Clearing global singleton: %p\n", (void*)g_two_phase_write_manager);
-      fflush(stderr);
-      g_two_phase_write_manager = nullptr;
-    } else {
-      fprintf(stderr, "[DBImpl::~DBImpl] NOT clearing global singleton (different instance): current=%p, global=%p\n", 
-              (void*)two_phase_write_manager_.get(), (void*)g_two_phase_write_manager);
-      fflush(stderr);
-    }
-  }
-  
   ThreadStatus::OperationType cur_op_type =
       ThreadStatusUtil::GetThreadOperation();
   ThreadStatusUtil::SetThreadOperation(ThreadStatus::OperationType::OP_UNKNOWN);
@@ -756,6 +741,18 @@ DBImpl::~DBImpl() {
     closing_status_.PermitUncheckedError();
   }
   ThreadStatusUtil::SetThreadOperation(cur_op_type);
+  
+  // Shutdown TwoPhaseWriteManager AFTER CloseImpl() to ensure all background
+  // compaction tasks are finished before destroying the ONNX predictor.
+  // This fixes the crash where compaction tries to use ONNX after it's destroyed.
+  if (two_phase_write_manager_) {
+    two_phase_write_manager_->Shutdown();
+    // Clear global singleton ONLY if it matches this instance
+    // This prevents clearing the global variable if a new DB instance has already been opened
+    if (g_two_phase_write_manager == two_phase_write_manager_.get()) {
+      g_two_phase_write_manager = nullptr;
+    }
+  }
 }
 
 void DBImpl::MaybeIgnoreError(Status* s) const {

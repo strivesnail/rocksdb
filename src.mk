@@ -39,6 +39,7 @@ LIB_SOURCES =                                                   \
   db/compaction/compaction_picker.cc                            \
   db/compaction/compaction_picker_fifo.cc                       \
   db/compaction/compaction_picker_level.cc                      \
+  db/compaction/compaction_picker_custom.cc                     \
   db/compaction/compaction_picker_universal.cc                  \
   db/compaction/compaction_service_job.cc                       \
   db/compaction/compaction_state.cc                             \
@@ -65,6 +66,7 @@ LIB_SOURCES =                                                   \
   db/event_helpers.cc                                           \
   db/event_helpers_ml_features.cc                              \
   db/two_phase_write_manager.cc                                \
+  db/custom_compaction_pri_manager.cc                          \
   db/experimental.cc                                           \
   db/external_sst_file_ingestion_job.cc                         \
   db/file_indexer.cc                                            \

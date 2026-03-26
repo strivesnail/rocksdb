@@ -60,6 +60,7 @@
 //   in the table's meta section to speed up ScanTable.
 
 #include <cinttypes>
+#include <cstdlib>
 
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
@@ -70,6 +71,7 @@
 #include "db/table_cache.h"
 #include "db/version_builder.h"
 #include "db/version_edit.h"
+#include "db/two_phase_write_manager.h"
 #include "db/write_batch_internal.h"
 #include "file/filename.h"
 #include "file/writable_file_writer.h"
@@ -458,8 +460,14 @@ class Repairer {
       meta.file_creation_time = current_time;
       SnapshotChecker* snapshot_checker = DisableGCSnapshotChecker::Instance();
 
+      const char* enable_phase2_env = std::getenv("ROCKSDB_ENABLE_PHASE2");
+      bool phase2_enabled =
+          (enable_phase2_env != nullptr && std::string(enable_phase2_env) == "1");
       auto write_hint = cfd->current()->storage_info()->CalculateSSTWriteHint(
           /*level=*/0, db_options_.calculate_sst_write_lifetime_hint_set);
+      if (phase2_enabled) {
+        write_hint = static_cast<Env::WriteLifeTimeHint>(6);  // L0 -> handle 6
+      }
 
       std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
           range_del_iters;
@@ -499,6 +507,17 @@ class Repairer {
                      "Log #%" PRIu64 ": %d ops saved to Table #%" PRIu64 " %s",
                      log, counter, meta.fd.GetNumber(),
                      status.ToString().c_str());
+      if (status.ok() && phase2_enabled) {
+        ROCKS_LOG_INFO(db_options_.info_log,
+            "[Repair] file #%" PRIu64 " (level=0) - 未预测，按 level 分配 handle 6",
+            meta.fd.GetNumber());
+        if (g_two_phase_write_manager &&
+            g_two_phase_write_manager->IsInitialized() &&
+            g_two_phase_write_manager->IsPhase2Enabled()) {
+          g_two_phase_write_manager->RegisterFileMetadata(
+              meta.fd.GetNumber(), 0, 6, meta.fd.GetFileSize());
+        }
+      }
       if (status.ok()) {
         if (meta.fd.GetFileSize() > 0) {
           table_fds_.push_back(meta.fd);

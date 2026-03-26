@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 
 # amalgamate.py creates an amalgamation from a unity build.
