@@ -9,6 +9,7 @@
 #include <cinttypes>
 
 #include "db/db_impl/db_impl.h"
+#include "db/two_phase_write_manager.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "logging/logging.h"
@@ -17,8 +18,31 @@
 #include "options/options_helper.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
+#include "db/write_batch_internal.h"
 
 namespace ROCKSDB_NAMESPACE {
+namespace {
+void MaybeRecordAdaptiveUserBytes(DBImpl* impl,
+                                  const WriteThread::WriteGroup& wg) {
+  TwoPhaseWriteManager* tpm = impl->GetTwoPhaseWriteManager();
+  if (tpm == nullptr) {
+    return;
+  }
+  size_t total = 0;
+  for (auto* writer : wg) {
+    assert(writer);
+    if (!writer->CheckCallback(impl)) {
+      continue;
+    }
+    if (writer->ShouldWriteToMemtable()) {
+      total = WriteBatchInternal::AppendedByteSize(
+          total, WriteBatchInternal::ByteSize(writer->batch));
+    }
+  }
+  tpm->RecordUserWriteBytesForAdaptive(static_cast<uint64_t>(total));
+}
+}  // namespace
+
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
                    const Slice& key, const Slice& val) {
@@ -587,6 +611,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
         }
       }
       if (w.status.ok()) {  // Don't publish a partial batch write
+        MaybeRecordAdaptiveUserBytes(this, *w.write_group);
         versions_->SetLastSequence(last_sequence);
       } else {
         HandleMemTableInsertFailure(w.status);
@@ -654,6 +679,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   IOStatus io_s;
   Status pre_release_cb_status;
   size_t seq_inc = 0;
+  size_t total_byte_size = 0;
   if (status.ok()) {
     // Rules for when we can update the memtable concurrently
     // 1. supported by memtable
@@ -670,7 +696,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                     write_group.size > 1;
     size_t total_count = 0;
     size_t valid_batches = 0;
-    size_t total_byte_size = 0;
+    total_byte_size = 0;
     size_t pre_release_callback_cnt = 0;
     for (auto* writer : write_group) {
       assert(writer);
@@ -947,6 +973,15 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       // Note: if we are to resume after non-OK statuses we need to revisit how
       // we react to non-OK statuses here.
       if (w.status.ok()) {  // Don't publish a partial batch write
+        MaybeRecordAdaptiveUserBytes(this, write_group);
+        if (wbwi != nullptr && status.ok() &&
+            wbwi->GetWriteBatch()->Count() > 0) {
+          TwoPhaseWriteManager* tpm = GetTwoPhaseWriteManager();
+          if (tpm != nullptr) {
+            tpm->RecordUserWriteBytesForAdaptive(static_cast<uint64_t>(
+                WriteBatchInternal::ByteSize(wbwi->GetWriteBatch())));
+          }
+        }
         versions_->SetLastSequence(last_sequence);
       }
     }
@@ -1117,6 +1152,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
           seq_per_batch_, batch_per_txn_);
       if (memtable_write_group.status
               .ok()) {  // Don't publish a partial batch write
+        MaybeRecordAdaptiveUserBytes(this, memtable_write_group);
         versions_->SetLastSequence(memtable_write_group.last_sequence);
       } else {
         HandleMemTableInsertFailure(memtable_write_group.status);
@@ -1150,6 +1186,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
 
     if (write_thread_.CompleteParallelMemTableWriter(&w)) {
       if (w.status.ok()) {  // Don't publish a partial batch write
+        MaybeRecordAdaptiveUserBytes(this, *w.write_group);
         versions_->SetLastSequence(w.write_group->last_sequence);
       } else {
         HandleMemTableInsertFailure(w.status);

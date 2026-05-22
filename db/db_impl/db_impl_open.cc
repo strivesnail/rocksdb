@@ -2721,7 +2721,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       
       impl->two_phase_write_manager_ = std::make_unique<TwoPhaseWriteManager>();
       Status init_status = impl->two_phase_write_manager_->Initialize(
-          model_dir, db_path, enable_phase2, impl->immutable_db_options_.info_log.get());
+          model_dir, db_path, enable_phase2,
+          impl->immutable_db_options_.info_log.get(), impl->stats_);
       
       // NO ERROR TOLERANCE - FAIL IMMEDIATELY
       if (!init_status.ok()) {

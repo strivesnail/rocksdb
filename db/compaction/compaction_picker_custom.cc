@@ -20,6 +20,18 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+void NoteCompactionStartLevelIfNeeded(Compaction* c) {
+  if (c == nullptr || g_two_phase_write_manager == nullptr) {
+    return;
+  }
+  const int sl = c->start_level();
+  if (sl >= 1 && sl <= 5) {
+    g_two_phase_write_manager->NoteLevelCompactionPicked(sl);
+  }
+}
+}  // namespace
+
 Compaction* CustomCompactionPicker::PickCompaction(
     const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
     const MutableDBOptions& mutable_db_options,
@@ -34,24 +46,30 @@ Compaction* CustomCompactionPicker::PickCompaction(
       (env_pred != nullptr && std::string(env_pred) == "1") ||
       (env_phase2 != nullptr && std::string(env_phase2) == "1");
   if (!use_custom_compaction) {
-    return LevelCompactionPicker::PickCompaction(
+    Compaction* c = LevelCompactionPicker::PickCompaction(
         cf_name, mutable_cf_options, mutable_db_options, existing_snapshots,
         snapshot_checker, vstorage, log_buffer, full_history_ts_low,
         require_max_output_level);
+    NoteCompactionStartLevelIfNeeded(c);
+    return c;
   }
   if (!g_two_phase_write_manager || !g_two_phase_write_manager->IsInitialized() ||
       !g_two_phase_write_manager->IsPhase2Enabled()) {
-    return LevelCompactionPicker::PickCompaction(
+    Compaction* c = LevelCompactionPicker::PickCompaction(
         cf_name, mutable_cf_options, mutable_db_options, existing_snapshots,
         snapshot_checker, vstorage, log_buffer, full_history_ts_low,
         require_max_output_level);
+    NoteCompactionStartLevelIfNeeded(c);
+    return c;
   }
   // Delegate to parent: builder will call TryCustomCompactionForLevel when
   // level is chosen and start_level_ != 0.
-  return LevelCompactionPicker::PickCompaction(
+  Compaction* c = LevelCompactionPicker::PickCompaction(
       cf_name, mutable_cf_options, mutable_db_options, existing_snapshots,
       snapshot_checker, vstorage, log_buffer, full_history_ts_low,
       require_max_output_level);
+  NoteCompactionStartLevelIfNeeded(c);
+  return c;
 }
 
 Compaction* CustomCompactionPicker::TryCustomCompactionForLevel(
@@ -78,9 +96,20 @@ Compaction* CustomCompactionPicker::TryCustomCompactionForLevel(
     if (normal_reason) *normal_reason = "use_custom_disabled";
     return nullptr;
   }
+  CustomReservationResult reserve =
+      g_two_phase_write_manager->TryReserveCustomForLevel(start_level);
+  if (reserve == CustomReservationResult::kBlocked) {
+    if (normal_reason) *normal_reason = "budget_cap_reached";
+    return nullptr;
+  }
+  const bool need_release_on_fail =
+      (reserve == CustomReservationResult::kAcquired);
   std::vector<FileLifetimeInfo> too_far =
       g_two_phase_write_manager->GetAllTooFarFiles(start_level, vstorage);
   if (too_far.empty()) {
+    if (need_release_on_fail) {
+      g_two_phase_write_manager->ReleaseCustomReservation(start_level);
+    }
     if (normal_reason) *normal_reason = "no_too_far_files";
     if (ioptions_.info_log) {
       ROCKS_LOG_INFO(ioptions_.info_log,
@@ -103,6 +132,9 @@ Compaction* CustomCompactionPicker::TryCustomCompactionForLevel(
       }
       return c;
     }
+  }
+  if (need_release_on_fail) {
+    g_two_phase_write_manager->ReleaseCustomReservation(start_level);
   }
   if (normal_reason) *normal_reason = "all_select_failed";
   if (ioptions_.info_log) {

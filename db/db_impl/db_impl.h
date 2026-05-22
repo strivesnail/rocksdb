@@ -1368,6 +1368,10 @@ class DBImpl : public DB {
 
   bool seq_per_batch() const { return seq_per_batch_; }
 
+  TwoPhaseWriteManager* GetTwoPhaseWriteManager() const {
+    return two_phase_write_manager_.get();
+  }
+
  protected:
   const std::string dbname_;
   // TODO(peterd): unify with VersionSet::db_id_

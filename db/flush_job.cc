@@ -873,7 +873,13 @@ Status FlushJob::WriteLevel0Table() {
     auto write_hint = base_->storage_info()->CalculateSSTWriteHint(
         /*level=*/0, db_options_.calculate_sst_write_lifetime_hint_set);
     if (phase2_enabled) {
-      write_hint = static_cast<Env::WriteLifeTimeHint>(6);  // L0 -> handle 6
+      int h = 6;
+      if (g_two_phase_write_manager && g_two_phase_write_manager->IsInitialized() &&
+          g_two_phase_write_manager->IsNativeBasePolicy()) {
+        h = g_two_phase_write_manager->GetTargetHandleForCompactionOutputMetadata(
+            /*file_number=*/0, /*level=*/0);
+      }
+      write_hint = static_cast<Env::WriteLifeTimeHint>(h);
     }
     Env::IOPriority io_priority = GetRateLimiterPriority();
     db_mutex_->Unlock();

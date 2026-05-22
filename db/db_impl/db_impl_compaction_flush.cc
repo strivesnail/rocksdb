@@ -1517,9 +1517,10 @@ Status DBImpl::TryRewriteTooFarFilesOnTrivialMove(Compaction& c,
       int output_handle =
           two_phase_write_manager_->GetTargetHandleForCompactionOutputMetadata(
               file_number, static_cast<int>(c.output_level()));
-      Env::WriteLifeTimeHint hint = (output_handle >= 6 && output_handle <= 12)
-          ? static_cast<Env::WriteLifeTimeHint>(output_handle)
-          : Env::WLTH_NOT_SET;
+      Env::WriteLifeTimeHint hint =
+          (output_handle >= 2 && output_handle <= 12)
+              ? static_cast<Env::WriteLifeTimeHint>(output_handle)
+              : Env::WLTH_NOT_SET;
       Status rewrite_status = RewriteFileAtomically(
           file_path, temp_file_path, f->fd.GetFileSize(), hint);
       if (!rewrite_status.ok()) {

@@ -494,7 +494,7 @@ class CompactionJob {
                                   ColumnFamilyData* cfd);
 
   // 解耦封装：根据环境变量返回 compaction 输出的 target handle。
-  // Phase2 时 L1–6 由 TwoPhaseWriteManager::GetTargetHandleForCompactionOutputMetadata（Initialize 时 ROCKSDB_HASH_HANDLE 必须为 0 或 1）；ML 预测开时走 MapLifetimeToHandle。
+  // Phase2：GetTargetHandleForCompactionOutputMetadata（HASH_HANDLE：0/1/2/no-fdp/3=native-base=Optimized 分档）；ML 开时 MapLifetimeToHandle。
   int GetTargetHandleForCompactionOutput(uint64_t file_number, int output_level,
                                          const double* feature_array,
                                          size_t feature_len);

@@ -290,6 +290,15 @@ void CompactionJob::Prepare(
 
   write_hint_ = storage_info->CalculateSSTWriteHint(
       c->output_level(), db_options_.calculate_sst_write_lifetime_hint_set);
+  if (g_two_phase_write_manager && g_two_phase_write_manager->IsInitialized() &&
+      g_two_phase_write_manager->IsPhase2Enabled() &&
+      g_two_phase_write_manager->IsNativeBasePolicy()) {
+    const int out_lvl = c->output_level();
+    const int meta =
+        g_two_phase_write_manager->GetTargetHandleForCompactionOutputMetadata(
+            /*file_number=*/0, out_lvl);
+    write_hint_ = static_cast<Env::WriteLifeTimeHint>(meta);
+  }
   bottommost_level_ = c->bottommost_level();
 
   if (!known_single_subcompact.has_value() && c->ShouldFormSubcompactions()) {
@@ -725,6 +734,7 @@ void CompactionJob::InitializeCompactionRun() {
     log_buffer_->FlushBufferToLog();
   }
   LogCompaction();
+  TwoPhaseAdaptiveNoteCompactionJobStarted();
 }
 
 void CompactionJob::RunSubcompactions() {
@@ -2391,6 +2401,10 @@ bool CompactionJob::ShouldUpdateSubcompactionProgress(
 int CompactionJob::GetTargetHandleForCompactionOutput(
     uint64_t file_number, int output_level, const double* feature_array,
     size_t feature_len) {
+#if !defined(ROCKSDB_ML_PREDICT_PYTHON) && !defined(ROCKSDB_ML_PREDICT_ONNX)
+  (void)feature_array;
+  (void)feature_len;
+#endif
   const char* collect_only = std::getenv("ROCKSDB_ML_COLLECT_ONLY");
   auto log_compaction_handle_fallback = [&](const char* reason) {
     if (!db_options_.info_log) {

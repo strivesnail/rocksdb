@@ -13,7 +13,17 @@
 - Phase 1模式（禁用）: 文件直接写入目标目录，不进行预测和二次写入
 - Phase 2模式（启用）: 文件先写入tmp目录，收集特征并预测生命周期，然后移动到目标handle
 
-### 2. ROCKSDB_ML_MODELS_PATH
+**与 Phase2 配套（必须）**：当 `ROCKSDB_ENABLE_PHASE2=1` 时，**必须**同时设置 **`ROCKSDB_HASH_HANDLE`** 为 **`0`** 或 **`1`**（字符串），否则 `DB::Open` 会返回 `InvalidArgument`：
+- **`0`**：L1–L6 compaction 输出按 **level-base** 映射 handle（7–12）
+- **`1`**：按 **file_number hash** 映射 handle
+
+未设置、空字符串或其它值均视为配置错误，避免静默与预期不符的行为。
+
+### 2. ROCKSDB_HASH_HANDLE（Phase2 时必填）
+
+见上。示例：`export ROCKSDB_HASH_HANDLE=1`
+
+### 3. ROCKSDB_ML_MODELS_PATH
 **ML模型目录路径**
 
 - **设置**: `export ROCKSDB_ML_MODELS_PATH=/path/to/models`
@@ -21,7 +31,7 @@
 
 **功能说明**: 指定ML模型文件所在的目录，包含按level训练的模型文件。
 
-### 3. ROCKSDB_TOOLS_PATH
+### 4. ROCKSDB_TOOLS_PATH
 **Python工具脚本路径（可选）**
 
 - **设置**: `export ROCKSDB_TOOLS_PATH=/path/to/tools`
@@ -34,8 +44,9 @@
 ### 方式1: 直接在命令行设置
 
 ```bash
-# 启用二次写入
+# 启用二次写入（必须带 HASH_HANDLE）
 export ROCKSDB_ENABLE_PHASE2=1
+export ROCKSDB_HASH_HANDLE=1   # 或 0
 export ROCKSDB_ML_MODELS_PATH=/path/to/models
 ./your_rocksdb_program
 
@@ -62,6 +73,7 @@ unset ROCKSDB_ENABLE_PHASE2
 #!/bin/bash
 # 设置环境变量
 export ROCKSDB_ENABLE_PHASE2=1
+export ROCKSDB_HASH_HANDLE=1
 export ROCKSDB_ML_MODELS_PATH="/path/to/models"
 
 # 执行程序
@@ -74,6 +86,7 @@ export ROCKSDB_ML_MODELS_PATH="/path/to/models"
 # Makefile示例
 run-phase2:
 	ROCKSDB_ENABLE_PHASE2=1 \
+	ROCKSDB_HASH_HANDLE=1 \
 	ROCKSDB_ML_MODELS_PATH=/path/to/models \
 	./your_program
 ```
@@ -95,4 +108,5 @@ bool enable_phase2 = (enable_phase2_env != nullptr &&
 2. **ROCKSDB_ENABLE_PHASE2** 必须精确设置为 `"1"` 才会启用，其他任何值（包括 `"true"`, `"yes"` 等）都会被当作禁用
 3. 如果模型路径不存在或模型加载失败，程序会记录警告但不会阻止数据库打开
 4. Phase 2模式需要Python环境和ML模型文件，如果缺少这些，二次写入功能可能无法正常工作
+5. **`sudo env ...`** 时务必把 **`ROCKSDB_HASH_HANDLE`** 一并传入子进程，否则 Phase2 打开会失败
 

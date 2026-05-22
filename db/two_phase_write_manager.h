@@ -21,6 +21,7 @@ namespace ROCKSDB_NAMESPACE {
 // Forward declaration
 class FSWritableFile;
 class Logger;
+class Statistics;
 class VersionStorageInfo;
 
 // 用于自定义 Compaction 选文件：当前存活时间超过阈值的文件信息
@@ -42,6 +43,14 @@ struct FileMetadata {
   int level;                // 所属 level (0–6)，-1 表示未知
 };
 
+// CustomCompactionPicker：too-far budget（L1–L5 每 N 次 compaction pick 至多 K 次 custom；
+// ROCKSDB_TOO_FAR_BUDGET 支持 "N"（=1/N）或 "K/N"；自适应 PROBE_KN 允许 K=0（0/N）。
+// window<=0 或 allow<0 表示未开启 cap；window>0 且 allow==0 表示本窗口 0 次 custom。）
+enum class CustomReservationResult {
+  kDisabled,  // 未开启 cap（budget 未设：window<=0 或 allow<0）
+  kAcquired,  // 已抢占本 cycle 的 custom 名额（customs_used 已自增）
+  kBlocked,   // 本 cycle 不允许 custom（K=0 或 customs_used>=K）
+};
 
 // 两阶段写入管理器
 class TwoPhaseWriteManager {
@@ -52,8 +61,11 @@ class TwoPhaseWriteManager {
   // 初始化（加载模型等）
   // enable_phase2: 是否启用Phase 2的两阶段写入（只有Phase 2才需要预测和二次写入）
   // info_log: RocksDB 日志对象，用于输出日志到 LOG 文件
+  // db_statistics: 可选；非空时自适应探针用 Statistics::BYTES_WRITTEN 与写路径 RecordTick
+  //   一致；为空则回退为 RecordUserWriteBytesForAdaptive 原子累加。
   Status Initialize(const std::string& model_dir, const std::string& db_path,
-                   bool enable_phase2 = false, Logger* info_log = nullptr);
+                   bool enable_phase2 = false, Logger* info_log = nullptr,
+                   Statistics* db_statistics = nullptr);
 
   // 处理文件创建（第一阶段：写入内存）
   // 返回：是否应该写入内存（Level 0返回false，直接写入目标目录）
@@ -95,7 +107,12 @@ class TwoPhaseWriteManager {
   // 检查是否启用Phase 2
   bool IsPhase2Enabled() const { return enable_phase2_; }
 
-  // 未预测时按 level 分配 handle：level [0,6] -> handle [6,12]，否则返回 -1
+  // ROCKSDB_HASH_HANDLE=3 / native / native-base：Optimized classification（粗分档，与 TorFS 对比用）
+  bool IsNativeBasePolicy() const;
+
+  // 按输出 level 一对一到 handle：L0→6，L1–L6→7–12，否则 -1。kLevelBase 下
+  // GetTargetHandleForCompactionOutputMetadata 等走此映射；Compaction 在
+  // ROCKSDB_ML_PREDICT=1 且预测成功时 L1–5 另见 MapLifetimeToHandle。
   static int LevelToHandle(int level);
 
   // 仅按 file_number + level 做 hash，将 L1–L6 均匀映射到 handle 7–12（7 + hash%6）；与预测解耦。L0 由调用方固定 6。
@@ -104,13 +121,30 @@ class TwoPhaseWriteManager {
   // 获取文件的target handle（用于自定义compaction排序）
   int GetFileTargetHandle(uint64_t file_number) const;
   
-  // 获取handle的阈值（用于判断文件是否"too far"）
-  // 返回该handle对应的最大生命周期（秒）
+  // 获取 handle 的 too-far 年龄阈值（秒）：handle 7–11 对应 L1–L5。
+  // 可选环境变量 ROCKSDB_TOO_FAR_THRESHOLDS_SEC="t7,t8,t9,t10,t11"（5 个逗号分隔
+  // 非负浮点，顺序对应 handle7..11，不要求单调递增）；未设或解析失败则默认 5,10,15,60,100。h6/h12 仍为 +inf。
+  // 进程内解析一次；Initialize 与 stderr 会打印生效值。
   double GetHandleThreshold(int handle) const;
 
   // 获取该 level 上所有“超过阈值”的文件（用于 CustomCompactionPicker）
   std::vector<FileLifetimeInfo> GetAllTooFarFiles(int level,
                                                    VersionStorageInfo* vstorage);
+
+  // L1–L5：ROCKSDB_TOO_FAR_BUDGET 周期间至多一次 kLevelTooFarFiles custom compaction。
+  // 仅 level∈[1,5] 受控；其它 level 一律返回 kDisabled。
+  CustomReservationResult TryReserveCustomForLevel(int level);
+  // 仅在 TryReserveCustomForLevel 返回 kAcquired 后、最终未能产出 Compaction 时调用。
+  void ReleaseCustomReservation(int level);
+  // 每次 level∈[1,5] 上确实选出 compaction（custom 或 baseline）后调用一次。
+  void NoteLevelCompactionPicked(int level);
+
+  // 自适应 too-far budget：若 Initialize 传入 Statistics，则探针用 BYTES_WRITTEN；
+  // 否则在写路径上按 WriteBatch 字节原子累加。
+  void RecordUserWriteBytesForAdaptive(uint64_t user_write_bytes);
+
+  // 供自适应日志写入 RocksDB LOG（可为 nullptr）。
+  Logger* GetInfoLog() const { return info_log_; }
 
   // 登记文件元数据（未走预测路径时调用，便于 GetAllTooFarFiles 用 creation_time 判断 too-far）
   // 用于 L0 flush、L6 固定、L1–L5 按 level 分配等场景
@@ -125,7 +159,12 @@ class TwoPhaseWriteManager {
   void RegisterCompactionOutputFileMetadata(uint64_t file_number, int level,
                                             uint64_t file_size);
 
-  // Phase2 开启时：L0→6；L1–L6 由 Initialize 时解析的 ROCKSDB_HASH_HANDLE（0=level-base，1=hash-base）决定，无静默 fallback。
+  // Phase2 开启时由 Initialize 解析的 ROCKSDB_HASH_HANDLE 决定元数据/写 hint 用的整型值：
+  //   0 = level-base（Lk→6+k），1 = hash-base（L1–6→7–12），2/no-fdp = 全 level 单 handle（6），
+  //   3/native/native-base = Optimized 分档：返回值即 Env::WriteLifeTimeHint
+  //   （MEDIUM=3→L0–L3，LONG=4→L4，EXTREME=5→≥L5；WAL=SHORT 仍由 CalculateWALWriteHint）。
+  // level-base（0）：本函数对 L1–6 即 LevelToHandle；CompactionJob 在 ROCKSDB_ML_PREDICT=1
+  // 且预测成功时，L1–5 会先 MapLifetimeToHandle（寿命分桶到 7–11），与「一层一 handle」不同。
   int GetTargetHandleForCompactionOutputMetadata(uint64_t file_number,
                                                  int level) const;
 
@@ -155,7 +194,7 @@ class TwoPhaseWriteManager {
   //   - sub_compact: SubcompactionState 指针（用于获取边界信息）
   //   - cfd: ColumnFamilyData 指针（用于获取 version 信息）
   //   - db_mutex: 数据库互斥锁
-  // 返回：预测的 handle（6-12），失败返回 -1
+  // 返回：预测的 handle（通常为 6–12；native-base 下为 3–5），失败返回 -1
   int PredictHandleBeforeWrite(uint64_t file_number, int level,
                                const Slice& first_key,
                                void* sub_compact,
@@ -199,8 +238,15 @@ class TwoPhaseWriteManager {
   std::string db_path_;
   std::string model_dir_;
   bool enable_phase2_;  // 是否启用Phase 2的两阶段写入
-  // Phase2 时由 ROCKSDB_HASH_HANDLE 在 Initialize 中解析，仅允许 "0" 或 "1"
-  bool use_hash_handle_{false};
+  // Phase2 时由 ROCKSDB_HASH_HANDLE 在 Initialize 中解析：
+  // "0"=level-base，"1"=hash-base，"2"/"no-fdp"=单 handle，"3"/"native"/"native-base"=Optimized 档
+  enum class HandleWritePolicy : uint8_t {
+    kLevelBase = 0,
+    kHashBase = 1,
+    kNoFdp = 2,
+    kNativeBase = 3,
+  };
+  HandleWritePolicy handle_write_policy_{HandleWritePolicy::kLevelBase};
   Logger* info_log_;     // RocksDB 日志对象，用于输出日志到 LOG 文件
   
   // 文件元数据映射（仅用于两阶段写入，不管理删除）
@@ -235,6 +281,10 @@ class TwoPhaseWriteManager {
 
 // 全局单例（由DBImpl管理生命周期）
 extern TwoPhaseWriteManager* g_two_phase_write_manager;
+
+// 每个 compaction job 开始时由 CompactionJob 调用；仅在 ADAPTIVE 且
+// ROCKSDB_TOO_FAR_BUDGET_ADAPTIVE_PROBE_ADVANCE=compactions 时递增计数。
+void TwoPhaseAdaptiveNoteCompactionJobStarted();
 
 }  // namespace ROCKSDB_NAMESPACE
 
