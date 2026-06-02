@@ -2268,6 +2268,23 @@ bool TwoPhaseWriteManager::IsFileTooFar(uint64_t file_number) const {
   return age_sec > threshold;
 }
 
+bool TwoPhaseWriteManager::IsFileTooFarForTrivialMoveRewrite(
+    uint64_t file_number) const {
+  std::shared_lock<std::shared_mutex> lock(metadata_mutex_);
+  auto it = file_metadata_.find(file_number);
+  if (it == file_metadata_.end()) return false;
+  uint64_t creation_time = it->second.creation_time;
+  if (creation_time == 0) return false;
+  int handle = it->second.target_handle;
+  if (handle < 3 || handle > 12) return false;
+  constexpr double kTrivialMoveRewriteThresholdMultiplier = 5.0;
+  double threshold =
+      GetHandleThreshold(handle) * kTrivialMoveRewriteThresholdMultiplier;
+  uint64_t now = Env::Default()->NowMicros();
+  double age_sec = (now - creation_time) / 1000000.0;
+  return age_sec > threshold;
+}
+
 std::vector<FileLifetimeInfo> TwoPhaseWriteManager::GetAllTooFarFiles(
     int level, VersionStorageInfo* vstorage) {
   std::vector<FileLifetimeInfo> result;

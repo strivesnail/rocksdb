@@ -185,6 +185,9 @@ class TwoPhaseWriteManager {
   // 判断某文件是否已“too far”（age > GetHandleThreshold(handle)）；无元数据或未超阈值返回 false
   bool IsFileTooFar(uint64_t file_number) const;
 
+  // trivial move 重写专用：age > 5 * GetHandleThreshold(handle)（自定义 compaction 仍用 IsFileTooFar / GetAllTooFarFiles）
+  bool IsFileTooFarForTrivialMoveRewrite(uint64_t file_number) const;
+
   // 在文件打开前预测 handle（新方案：无需二次写入）
   // 使用精确的 smallest（first_key）+ 估算的 largest 来计算特征和预测
   // 参数：

@@ -1508,7 +1508,8 @@ Status DBImpl::TryRewriteTooFarFilesOnTrivialMove(Compaction& c,
     for (size_t i = 0; i < c.num_input_files(l); i++) {
       FileMetaData* f = c.input(l, i);
       uint64_t file_number = f->fd.GetNumber();
-      if (!two_phase_write_manager_->IsFileTooFar(file_number)) {
+      if (!two_phase_write_manager_->IsFileTooFarForTrivialMoveRewrite(
+              file_number)) {
         continue;
       }
       std::string file_path = TableFileName(
