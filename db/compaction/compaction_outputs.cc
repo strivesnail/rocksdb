@@ -396,7 +396,7 @@ Status CompactionOutputs::AddToOutput(
   }
 
   // Open output file if necessary
-  // 传入当前 key 作为文件的 smallest（100% 精确）
+
   if (!HasBuilder()) {
     s = open_file_func(*this, key);
     if (!s.ok()) {

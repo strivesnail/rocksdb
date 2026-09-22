@@ -182,12 +182,12 @@ double CalculateKeyDistance(const FileMetaData* file1,
                     static_cast<const void*>(file2));
     return std::numeric_limits<double>::max();
   }
-  
+
   // Safely extract FileDescriptor and InternalKey values to local variables
   // This minimizes risk of accessing invalid memory
   FileDescriptor file1_fd, file2_fd;
   InternalKey file1_smallest, file1_largest, file2_smallest, file2_largest;
-  
+
   try {
     // Copy FileDescriptor members individually
     file1_fd.packed_number_and_path_id = file1->fd.packed_number_and_path_id;
@@ -195,13 +195,13 @@ double CalculateKeyDistance(const FileMetaData* file1,
     file1_fd.smallest_seqno = file1->fd.smallest_seqno;
     file1_fd.largest_seqno = file1->fd.largest_seqno;
     file1_fd.table_reader = file1->fd.table_reader;
-    
+
     file2_fd.packed_number_and_path_id = file2->fd.packed_number_and_path_id;
     file2_fd.file_size = file2->fd.file_size;
     file2_fd.smallest_seqno = file2->fd.smallest_seqno;
     file2_fd.largest_seqno = file2->fd.largest_seqno;
     file2_fd.table_reader = file2->fd.table_reader;
-    
+
     // Copy InternalKey values
     file1_smallest = file1->smallest;
     file1_largest = file1->largest;
@@ -215,7 +215,7 @@ double CalculateKeyDistance(const FileMetaData* file1,
                     file1_fd.GetNumber(), file2_fd.GetNumber());
     return std::numeric_limits<double>::max();
   }
-  
+
   if (file1_smallest.unset() || file1_largest.unset() ||
       file2_smallest.unset() || file2_largest.unset()) {
     ROCKS_LOG_ERROR(info_log,
@@ -225,7 +225,7 @@ double CalculateKeyDistance(const FileMetaData* file1,
                     file1_fd.GetNumber(), file2_fd.GetNumber());
     return std::numeric_limits<double>::max();
   }
-  
+
   int cmp1 = icmp->Compare(file1_largest, file2_smallest);
   int cmp2 = icmp->Compare(file1_smallest, file2_largest);
 
@@ -371,9 +371,9 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
                          uint64_t num_entries, int level, ColumnFamilyData* cfd,
                          MLFeatures* features, InstrumentedMutex* db_mutex) {
   uint64_t file_number = fd.GetNumber();
-  
+
   Logger* info_log = cfd ? cfd->ioptions().info_log.get() : nullptr;
-  
+
   // Validate parameters (mimicking RocksDB's approach)
   if (cfd == nullptr || features == nullptr) {
     if (info_log) {
@@ -428,7 +428,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   if (db_mutex != nullptr) {
     lock.reset(new InstrumentedMutexLock(db_mutex));
   }
-  
+
   // Get Version and VersionStorageInfo under mutex protection
   Version* version = cfd->current();
   if (version == nullptr) {
@@ -440,11 +440,11 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     }
     return false;
   }
-  
+
   // Increment reference count to prevent Version from being deleted
   version->Ref();
   VersionStorageInfo* vstorage = version->storage_info();
-  
+
   if (vstorage == nullptr) {
     version->Unref();
     if (info_log) {
@@ -455,26 +455,26 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     }
     return false;
   }
-  
+
   // RAII helper to ensure Version reference is released
   struct VersionRefGuard {
     Version* version_;
-    
+
     VersionRefGuard(Version* v) : version_(v) {}
-    
+
     ~VersionRefGuard() {
       if (version_ != nullptr) {
         version_->Unref();
       }
     }
-    
+
     // Non-copyable
     VersionRefGuard(const VersionRefGuard&) = delete;
     VersionRefGuard& operator=(const VersionRefGuard&) = delete;
   };
-  
+
   VersionRefGuard version_guard(version);
-  
+
   const auto& ioptions = cfd->ioptions();
   const auto& mutable_cf_options = cfd->GetLatestMutableCFOptions();
   const InternalKeyComparator* icmp = &cfd->internal_comparator();
@@ -497,7 +497,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     int level_files_count = vstorage->NumLevelFiles(level);
     if (level_files_count > 0) {
       const std::vector<FileMetaData*>& level_files_ref = vstorage->LevelFiles(level);
-      
+
       // Sanity check: reasonable maximum (prevent invalid size values)
       const size_t kMaxReasonableFiles = 1000000;
       size_t level_files_size = static_cast<size_t>(level_files_count);
@@ -509,7 +509,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
         }
         level_files_size = 0;
       }
-      
+
       // Use size-based copy instead of iterator range to avoid iterator invalidation
       level_files.reserve(level_files_size);
       for (size_t i = 0; i < level_files_size; ++i) {
@@ -537,7 +537,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     }
     // Continue with empty level_files
   }
-  
+
   // Create a temporary file list that includes current file for score calculation
   std::vector<FileMetaData*> files_with_current = level_files;
   // Note: Current file might not be in vstorage yet, so we create a temporary
@@ -550,7 +550,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     temp_file.largest = file_largest;
     temp_file.compensated_file_size = compensated_file_size;
     temp_file.num_entries = num_entries;
-    
+
     // Set oldest_ancester_time to current time for newly created files
     // This ensures ttl_boost_score is calculated correctly (should be 1 for new files)
     int64_t curr_time = 0;
@@ -573,12 +573,12 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   files_with_current.push_back(&temp_file);
 
   // ========== Score and Rank Features (1-9) ==========
-  
+
   // Calculate active_score using extracted keys
   double active_score_raw = CalculateFileScoreForMinOverlappingRatio(
       &file_smallest, &file_largest, file_number, compensated_file_size, vstorage, level, icmp, ioptions,
       mutable_cf_options, info_log, db_mutex);
-  
+
   // Debug logging: always log active_score_raw to diagnose score=0 issue
   if (info_log) {
     ROCKS_LOG_DEBUG(info_log,
@@ -586,7 +586,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
                     "(compensated_file_size=%" PRIu64 ")",
                     active_score_raw, file_number, level, compensated_file_size);
   }
-  
+
   // Apply TTL boost and compensated_file_size normalization
   // Completely copy RocksDB native implementation from SortFileByOverlappingRatio
   uint64_t ttl = mutable_cf_options.ttl;
@@ -596,12 +596,12 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     // If we can't get time, disable TTL. (Exactly as RocksDB does)
     ttl = 0;
   }
-  
+
   FileTtlBooster ttl_booster(static_cast<uint64_t>(curr_time), ttl,
                              vstorage->num_non_empty_levels(), level);
   uint64_t ttl_boost_score = (ttl > 0) ? ttl_booster.GetBoostScore(&temp_file) : 1;
   assert(ttl_boost_score > 0);
-  
+
   // Check for division by zero - compensated_file_size should never be 0
   if (compensated_file_size == 0) {
     if (info_log) {
@@ -616,7 +616,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     fflush(stderr);
     return false;
   }
-  
+
   // Calculate score exactly as RocksDB does: overlapping_bytes * 1024U / compensated_file_size / ttl_boost_score
   // This is integer division, producing uint64_t result
   uint64_t score = static_cast<uint64_t>(active_score_raw) * 1024U /
@@ -628,7 +628,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   double passive_score_raw = CalculatePassiveScoreForMinOverlappingRatio(
       &file_smallest, &file_largest, file_number, compensated_file_size, vstorage, level, icmp, ioptions,
       mutable_cf_options, info_log, db_mutex);
-  
+
   // Debug logging: always log passive_score_raw to diagnose score=0 issue
   if (info_log) {
     ROCKS_LOG_DEBUG(info_log,
@@ -636,7 +636,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
                     "(compensated_file_size=%" PRIu64 ")",
                     passive_score_raw, file_number, level, compensated_file_size);
   }
-  
+
   // Calculate passive score exactly as active score (same TTL boost logic)
   // Completely copy RocksDB native implementation from SortFileByOverlappingRatio
   uint64_t passive_ttl = mutable_cf_options.ttl;
@@ -646,12 +646,12 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     // If we can't get time, disable TTL. (Exactly as RocksDB does)
     passive_ttl = 0;
   }
-  
+
   FileTtlBooster passive_ttl_booster(static_cast<uint64_t>(passive_curr_time), passive_ttl,
                                     vstorage->num_non_empty_levels(), level);
   uint64_t passive_ttl_boost_score = (passive_ttl > 0) ? passive_ttl_booster.GetBoostScore(&temp_file) : 1;
   assert(passive_ttl_boost_score > 0);
-  
+
   // Check for division by zero (compensated_file_size should already be checked, but be safe)
   if (compensated_file_size == 0) {
     if (info_log) {
@@ -665,7 +665,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     fflush(stderr);
     return false;
   }
-  
+
   // Calculate score exactly as RocksDB does: overlapping_bytes * 1024U / compensated_file_size / ttl_boost_score
   // This is integer division, producing uint64_t result
   uint64_t passive_score_value = static_cast<uint64_t>(passive_score_raw) * 1024U /
@@ -678,17 +678,17 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   // Instead of calculating all scores and sorting, we can:
   // 1. Count how many files have lower scores than current file
   // 2. This avoids full sorting and reduces computation
-  
+
   struct FileScoreInfo {
     const FileMetaData* file;
     double active_score;
     double passive_score;
   };
-  
+
   // For large levels, limit the number of files we process to avoid slowdown
   const size_t max_files_for_rank_calc = 1000;
   const size_t files_to_process = std::min(level_files.size(), max_files_for_rank_calc);
-  
+
   std::vector<FileScoreInfo> file_scores;
   file_scores.reserve(files_to_process + 1);
 
@@ -721,11 +721,11 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     InternalKey f_largest = f->largest;
     uint64_t f_number = f_fd.GetNumber();  // Use copied fd
     uint64_t f_compensated_size = f->compensated_file_size;
-    
+
     double f_active_score_raw = CalculateFileScoreForMinOverlappingRatio(
         &f_smallest, &f_largest, f_number, f_compensated_size, vstorage, level, icmp, ioptions,
         mutable_cf_options, info_log, db_mutex);
-    
+
     // Apply TTL boost and normalization
     // Completely copy RocksDB native implementation from SortFileByOverlappingRatio
     uint64_t f_ttl = mutable_cf_options.ttl;
@@ -735,24 +735,24 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       // If we can't get time, disable TTL. (Exactly as RocksDB does)
       f_ttl = 0;
     }
-    
+
     FileTtlBooster f_ttl_booster(static_cast<uint64_t>(f_curr_time), f_ttl,
                                 vstorage->num_non_empty_levels(), level);
     uint64_t f_ttl_boost_score = (f_ttl > 0) ? f_ttl_booster.GetBoostScore(const_cast<FileMetaData*>(f)) : 1;
     assert(f_ttl_boost_score > 0);
     assert(f_compensated_size != 0);
-    
+
     // Calculate score exactly as RocksDB does: overlapping_bytes * 1024U / compensated_file_size / ttl_boost_score
     uint64_t f_score = static_cast<uint64_t>(f_active_score_raw) * 1024U /
                       f_compensated_size /
                       f_ttl_boost_score;
     double active_score = static_cast<double>(f_score);
-    
+
     // Calculate passive_score for each file
     double f_passive_score_raw = CalculatePassiveScoreForMinOverlappingRatio(
         &f_smallest, &f_largest, f_number, f_compensated_size, vstorage, level, icmp, ioptions,
         mutable_cf_options, info_log, db_mutex);
-    
+
     // Calculate passive score exactly as active score (same TTL boost logic)
     // Completely copy RocksDB native implementation from SortFileByOverlappingRatio
     uint64_t f_passive_ttl = mutable_cf_options.ttl;
@@ -762,13 +762,13 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       // If we can't get time, disable TTL. (Exactly as RocksDB does)
       f_passive_ttl = 0;
     }
-    
+
     FileTtlBooster f_passive_ttl_booster(static_cast<uint64_t>(f_passive_curr_time), f_passive_ttl,
                                          vstorage->num_non_empty_levels(), level);
     uint64_t f_passive_ttl_boost_score = (f_passive_ttl > 0) ? f_passive_ttl_booster.GetBoostScore(const_cast<FileMetaData*>(f)) : 1;
     assert(f_passive_ttl_boost_score > 0);
     assert(f_compensated_size != 0);
-    
+
     // Calculate score exactly as RocksDB does: overlapping_bytes * 1024U / compensated_file_size / ttl_boost_score
     uint64_t f_passive_score = static_cast<uint64_t>(f_passive_score_raw) * 1024U /
                               f_compensated_size /
@@ -798,7 +798,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
               // If scores are equal, compare by key (smaller is better)
               return icmp->Compare(a.file->smallest, b.file->smallest) < 0;
             });
-  
+
   // Find the rank of the current file using standard competition ranking
   // Files with the same score get the same rank, next rank skips the tied count
   // Example: scores [10, 10, 5, 5, 0] -> ranks [1, 1, 3, 3, 5]
@@ -807,13 +807,13 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     if (file_scores[i].file == &temp_file) {
       // Find the first file with the same score (going backwards)
       size_t first_same_score_idx = i;
-      while (first_same_score_idx > 0 && 
+      while (first_same_score_idx > 0 &&
              file_scores[first_same_score_idx - 1].active_score == file_scores[i].active_score) {
         first_same_score_idx--;
       }
       // Rank is the position of the first file with the same score + 1
       active_rank = static_cast<int>(first_same_score_idx + 1);
-      
+
       // Debug logging: if score is 0 but rank is not 1, log why
       if (info_log && features->first_active_score == 0.0 && active_rank > 1) {
         // Count how many files have score > 0
@@ -854,7 +854,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
               // If scores are equal, compare by key (smaller is better) - exactly as RocksDB does
               return icmp->Compare(a.file->smallest, b.file->smallest) < 0;
             });
-  
+
   // Find the rank of the current file using standard competition ranking
   // Files with the same score get the same rank, next rank skips the tied count
   // Example: scores [10, 10, 5, 5, 0] -> ranks [1, 1, 3, 3, 5]
@@ -863,7 +863,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     if (file_scores[i].file == &temp_file) {
       // Find the first file with the same score (going backwards)
       size_t first_same_score_idx = i;
-      while (first_same_score_idx > 0 && 
+      while (first_same_score_idx > 0 &&
              file_scores[first_same_score_idx - 1].passive_score == file_scores[i].passive_score) {
         first_same_score_idx--;
       }
@@ -893,7 +893,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   features->score_difference = features->first_active_score - features->first_passive_score;
 
   // ========== Level State Features (10-37) ==========
-  
+
   // Get cumulative_file_count from InternalStats (global counter, thread-safe, never reset)
   // This tracks all files ever created in the current level, including deleted ones
   InternalStats* internal_stats = cfd->internal_stats();
@@ -966,7 +966,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     try {
       // Use NumLevelFiles() to safely get file count
       count = vstorage->NumLevelFiles(l);
-      
+
       // Calculate total size for this level
       // Use NumLevelBytes() directly from RocksDB's data structure instead of manually iterating
       // This ensures we include all files (including trivial move files) and is more efficient
@@ -1084,7 +1084,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   }
 
   // ========== Key Space Features (38-55) ==========
-  
+
   // key_range: Format key range in hex format: "smallest .. largest"
   // Helper function to convert Slice to hex string
   auto SliceToHex = [](const Slice& s) -> std::string {
@@ -1095,14 +1095,14 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     }
     return oss.str();
   };
-  
+
   if (!file_smallest.unset() && !file_largest.unset()) {
     Slice smallest_user_key = file_smallest.user_key();
     Slice largest_user_key = file_largest.user_key();
     std::string smallest_hex = SliceToHex(smallest_user_key);
     std::string largest_hex = SliceToHex(largest_user_key);
     features->key_range = smallest_hex + " .. " + largest_hex;
-    
+
     // key_range_size = largest_key - smallest_key + 1
     // Calculate directly from hex strings to avoid byte order issues
     // Also set key_range_start and key_range_end for ML training
@@ -1159,13 +1159,13 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       } else {
         // Note: Mutex is already held by caller (CalculateMLFeatures)
         // No need to acquire mutex here
-        
+
         // Get overlapping files
         std::vector<FileMetaData*> lower_level_files;
         lower_level_files.reserve(100);
         vstorage->GetOverlappingInputs(lower_level, &file_smallest, &file_largest,
                                         &lower_level_files);
-        
+
         // Immediately copy FileDescriptor values while holding mutex
         // This prevents accessing freed FileMetaData objects after mutex is released
         lower_level_file_descriptors.reserve(lower_level_files.size());
@@ -1204,7 +1204,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       }
       // Continue with overlap_with_lower = 0
     }
-    
+
     // Now use copied FileDescriptor values, safe from concurrent modification
     for (const FileDescriptor& lower_fd : lower_level_file_descriptors) {
       try {
@@ -1240,13 +1240,13 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       } else {
         // Note: Mutex is already held by caller (CalculateMLFeatures)
         // No need to acquire mutex here
-        
+
         // Get overlapping files
         std::vector<FileMetaData*> upper_level_files;
         upper_level_files.reserve(100);
         vstorage->GetOverlappingInputs(upper_level, &file_smallest, &file_largest,
                                        &upper_level_files);
-        
+
         // Immediately copy FileDescriptor values while holding mutex
         // This prevents accessing freed FileMetaData objects after mutex is released
         upper_level_file_descriptors.reserve(upper_level_files.size());
@@ -1285,7 +1285,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       }
       // Continue with overlap_with_upper = 0
     }
-    
+
     // Now use copied FileDescriptor values, safe from concurrent modification
     for (const FileDescriptor& upper_fd : upper_level_file_descriptors) {
       try {
@@ -1312,7 +1312,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     features->overlap_ratio_with_lower =
         static_cast<double>(features->overlap_with_lower) / features->key_range_size;
   }
-  
+
   // Calculate overlap_ratio_with_upper
   // Formula: overlap_ratio = overlap_with_upper / key_range_size
   if (features->key_range_size > 0) {
@@ -1330,7 +1330,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
                     features->overlap_with_lower,
                     features->overlap_count_with_lower);
   }
-  
+
   if (features->key_range_size > 0) {
     if (features->overlap_with_lower > 0) {
       features->overlap_ratio_with_lower =
@@ -1370,7 +1370,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   }
   features->key_range_position_in_level = static_cast<double>(position);
   if (current_file_count > 1) {
-    features->key_range_percentile_in_level = 
+    features->key_range_percentile_in_level =
         static_cast<double>(position) / static_cast<double>(current_file_count - 1);
   } else {
     features->key_range_percentile_in_level = 0.0;
@@ -1385,7 +1385,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   };
   NeighborInfo left_neighbor_info = {InternalKey(), InternalKey(), nullptr};
   NeighborInfo right_neighbor_info = {InternalKey(), InternalKey(), nullptr};
-  
+
   for (const auto* other_file : level_files) {
     // Safety check: report error for null or invalid file pointers
     if (other_file == nullptr) {
@@ -1399,7 +1399,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     InternalKey other_smallest = other_file->smallest;
     InternalKey other_largest = other_file->largest;
     FileDescriptor other_fd = other_file->fd;  // Copy for logging
-    
+
     if (other_smallest.unset() || other_largest.unset()) {
       ROCKS_LOG_ERROR(info_log,
                       "[ML Features] Invalid file with unset keys in "
@@ -1425,7 +1425,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
       }
     }
   }
-  
+
   const FileMetaData* left_neighbor = left_neighbor_info.ptr;
   const FileMetaData* right_neighbor = right_neighbor_info.ptr;
 
@@ -1462,7 +1462,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
     // No neighbors
     features->min_neighbor_key_distance = -1.0;
   }
-  
+
   // Calculate average neighbor distance
   // Formula: avg_neighbor_key_distance = (left_neighbor_key_distance + right_neighbor_key_distance) / 2
   // Semantics:
@@ -1487,7 +1487,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   }
 
   // ========== Competition Features (56-59) ==========
-  
+
   // Count files with better/worse scores
   // When all scores are 0, use key position as tiebreaker
   bool all_active_scores_zero = (features->first_active_score == 0.0);
@@ -1528,31 +1528,31 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
   }
 
   // ========== Cross Level Features (60-61) ==========
-  
+
   // lower_level_capacity_ratio = lower_level_size / MaxBytesForLevel(lower_level)
   if (level < vstorage->num_levels() - 1) {
     int lower_level = level + 1;
     uint64_t lower_level_size = vstorage->NumLevelBytes(lower_level);
     uint64_t lower_level_max = vstorage->MaxBytesForLevel(lower_level);
     if (lower_level_max > 0) {
-      features->lower_level_capacity_ratio = 
+      features->lower_level_capacity_ratio =
           static_cast<double>(lower_level_size) / static_cast<double>(lower_level_max);
     }
   }
-  
+
   // upper_level_capacity_ratio = upper_level_size / MaxBytesForLevel(upper_level)
   if (level > 0) {
     int upper_level = level - 1;
     uint64_t upper_level_size = vstorage->NumLevelBytes(upper_level);
     uint64_t upper_level_max = vstorage->MaxBytesForLevel(upper_level);
     if (upper_level_max > 0) {
-      features->upper_level_capacity_ratio = 
+      features->upper_level_capacity_ratio =
           static_cast<double>(upper_level_size) / static_cast<double>(upper_level_max);
     }
   }
 
   // ========== Composite Scores ==========
-  
+
   // urgency_score = file_count_ratio * (1 / active_rank_normalized)
   if (features->active_rank_normalized > 0) {
     features->urgency_score = features->file_count_ratio / features->active_rank_normalized;
@@ -1560,7 +1560,7 @@ bool CalculateMLFeatures(const FileDescriptor& fd, const InternalKey& smallest,
 
   // health_score = 1 / (1 + level_avg_score)
   features->health_score = 1.0 / (1.0 + features->level_avg_score);
-  
+
   // stability_score = 1 / (1 + overlap_ratio_with_lower + overlap_ratio_with_upper)
   features->stability_score = 1.0 / (1.0 + features->overlap_ratio_with_lower + features->overlap_ratio_with_upper);
 
@@ -1615,7 +1615,7 @@ void WriteMLFeaturesToJSON(const MLFeatures& features, JSONWriter* jwriter) {
           << "overlap_count_with_upper" << features.overlap_count_with_upper
           << "overlap_ratio_with_lower" << features.overlap_ratio_with_lower
           << "overlap_ratio_with_upper" << features.overlap_ratio_with_upper;
-  
+
   // Neighbor features (4 features)
   WriteDoubleOrInf(jwriter, "left_neighbor_key_distance", features.left_neighbor_key_distance);
   WriteDoubleOrInf(jwriter, "right_neighbor_key_distance", features.right_neighbor_key_distance);
@@ -1666,7 +1666,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   const bool need_other = SubsetHasAnyInRange(subset_indices, 64, 68);
   const bool need_key_effective = need_key || need_overlap;
   const bool need_rank_effective = need_rank || need_competition;
-  
+
   // Validate parameters
   if (cfd == nullptr || features == nullptr) {
     if (info_log) {
@@ -1718,7 +1718,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   if (db_mutex != nullptr) {
     lock.reset(new InstrumentedMutexLock(db_mutex));
   }
-  
+
   // Get Version and VersionStorageInfo under mutex protection
   Version* version = cfd->current();
   if (version == nullptr) {
@@ -1729,11 +1729,11 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     }
     return false;
   }
-  
+
   // Increment reference count to prevent Version from being deleted
   version->Ref();
   VersionStorageInfo* vstorage = version->storage_info();
-  
+
   if (vstorage == nullptr) {
     version->Unref();
     if (info_log) {
@@ -1743,26 +1743,26 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     }
     return false;
   }
-  
+
   // RAII helper to ensure Version reference is released
   struct VersionRefGuard {
     Version* version_;
-    
+
     VersionRefGuard(Version* v) : version_(v) {}
-    
+
     ~VersionRefGuard() {
       if (version_ != nullptr) {
         version_->Unref();
       }
     }
-    
+
     // Non-copyable
     VersionRefGuard(const VersionRefGuard&) = delete;
     VersionRefGuard& operator=(const VersionRefGuard&) = delete;
   };
-  
+
   VersionRefGuard version_guard(version);
-  
+
   const auto& ioptions = cfd->ioptions();
   const auto& mutable_cf_options = cfd->GetCurrentMutableCFOptions();
   const InternalKeyComparator* icmp = &cfd->internal_comparator();
@@ -1789,7 +1789,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     // Default to 16MB (typical SST file size)
     estimated_compensated_file_size = 16 * 1024 * 1024;
   }
-  
+
   // Validation LOG: Input parameters
   if (info_log) {
     Slice smallest_user_key = ExtractUserKey(file_smallest.Encode());
@@ -1818,7 +1818,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
         }
         level_files_size = 0;
       }
-      
+
       level_files.reserve(level_files_size);
       for (size_t i = 0; i < level_files_size; ++i) {
         const FileMetaData* f = nullptr;
@@ -1845,7 +1845,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     }
     // Continue with empty level_files
   }
-  
+
   // Create a temporary file list that includes current file for score calculation
   std::vector<FileMetaData*> files_with_current = level_files;
   FileMetaData temp_file;
@@ -1858,7 +1858,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     temp_file.largest = file_largest;
     temp_file.compensated_file_size = estimated_compensated_file_size;
     temp_file.num_entries = num_entries;
-    
+
     // Set oldest_ancester_time to current time for newly created files
     int64_t curr_time = 0;
     Status time_status = ioptions.clock->GetCurrentTime(&curr_time);
@@ -1876,10 +1876,10 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     return false;
   }
   files_with_current.push_back(&temp_file);
-  
-  // 预先计算 current_file_count（在条件块外使用）
+
+
   int current_file_count = vstorage->NumLevelFiles(level) + 1;
-  
+
   struct FileScoreInfo {
     const FileMetaData* file;
     double active_score;
@@ -1889,13 +1889,13 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
 
   if (need_rank_effective) {
   // ========== Score and Rank Features (0-10) ==========
-  
-  // 所有 Level (1-5) 都计算 score/rank 特征
+
+
   // Calculate active_score using estimated file size
   double active_score_raw = CalculateFileScoreForMinOverlappingRatio(
       &file_smallest, &file_largest, 0, estimated_compensated_file_size, vstorage, level, icmp, ioptions,
       mutable_cf_options, info_log, db_mutex);
-  
+
   // Apply TTL boost and compensated_file_size normalization
   uint64_t ttl = mutable_cf_options.ttl;
   int64_t curr_time;
@@ -1903,19 +1903,19 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   if (!status.ok()) {
     ttl = 0;
   }
-  
+
   FileTtlBooster ttl_booster(static_cast<uint64_t>(curr_time), ttl,
                              vstorage->num_non_empty_levels(), level);
   uint64_t ttl_boost_score = (ttl > 0) ? ttl_booster.GetBoostScore(&temp_file) : 1;
   assert(ttl_boost_score > 0);
   assert(estimated_compensated_file_size != 0);
-  
+
   // Calculate score exactly as RocksDB does: overlapping_bytes * 1024U / compensated_file_size / ttl_boost_score
   uint64_t score = static_cast<uint64_t>(active_score_raw) * 1024U /
                    estimated_compensated_file_size /
                    ttl_boost_score;
   features->first_active_score = static_cast<double>(score);
-  
+
   // Validation LOG: Score calculation
   if (info_log) {
     ROCKS_LOG_INFO(info_log,
@@ -1930,7 +1930,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   double passive_score_raw = CalculatePassiveScoreForMinOverlappingRatio(
       &file_smallest, &file_largest, 0, estimated_compensated_file_size, vstorage, level, icmp, ioptions,
       mutable_cf_options, info_log, db_mutex);
-  
+
   // Calculate passive score exactly as active score (same TTL boost logic)
   uint64_t passive_ttl = mutable_cf_options.ttl;
   int64_t passive_curr_time;
@@ -1938,25 +1938,25 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   if (!passive_status.ok()) {
     passive_ttl = 0;
   }
-  
+
   FileTtlBooster passive_ttl_booster(static_cast<uint64_t>(passive_curr_time), passive_ttl,
                                     vstorage->num_non_empty_levels(), level);
   uint64_t passive_ttl_boost_score = (passive_ttl > 0) ? passive_ttl_booster.GetBoostScore(&temp_file) : 1;
   assert(passive_ttl_boost_score > 0);
   assert(estimated_compensated_file_size != 0);
-  
+
   uint64_t passive_score_value = static_cast<uint64_t>(passive_score_raw) * 1024U /
                                   estimated_compensated_file_size /
                                   passive_ttl_boost_score;
   features->first_passive_score = static_cast<double>(passive_score_value);
 
   // Calculate scores for all files in level to determine rank
-  // FileScoreInfo 已在条件块外定义
-  
+
+
   const size_t max_files_for_rank_calc = 1000;
   const size_t files_to_process = std::min(level_files.size(), max_files_for_rank_calc);
-  
-  // file_scores 已在条件块外定义
+
+
   file_scores.reserve(files_to_process + 1);
 
   // Calculate scores for existing files
@@ -1988,46 +1988,46 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     InternalKey f_largest = f->largest;
     uint64_t f_number = f_fd.GetNumber();
     uint64_t f_compensated_size = f->compensated_file_size;
-    
+
     double f_active_score_raw = CalculateFileScoreForMinOverlappingRatio(
         &f_smallest, &f_largest, f_number, f_compensated_size, vstorage, level, icmp, ioptions,
         mutable_cf_options, info_log, db_mutex);
-    
+
     uint64_t f_ttl = mutable_cf_options.ttl;
     int64_t f_curr_time;
     Status f_status = ioptions.clock->GetCurrentTime(&f_curr_time);
     if (!f_status.ok()) {
       f_ttl = 0;
     }
-    
+
     FileTtlBooster f_ttl_booster(static_cast<uint64_t>(f_curr_time), f_ttl,
                                 vstorage->num_non_empty_levels(), level);
     uint64_t f_ttl_boost_score = (f_ttl > 0) ? f_ttl_booster.GetBoostScore(const_cast<FileMetaData*>(f)) : 1;
     assert(f_ttl_boost_score > 0);
     assert(f_compensated_size != 0);
-    
+
     uint64_t f_score = static_cast<uint64_t>(f_active_score_raw) * 1024U /
                       f_compensated_size /
                       f_ttl_boost_score;
     double active_score = static_cast<double>(f_score);
-    
+
     double f_passive_score_raw = CalculatePassiveScoreForMinOverlappingRatio(
         &f_smallest, &f_largest, f_number, f_compensated_size, vstorage, level, icmp, ioptions,
         mutable_cf_options, info_log, db_mutex);
-    
+
     uint64_t f_passive_ttl = mutable_cf_options.ttl;
     int64_t f_passive_curr_time;
     Status f_passive_status = ioptions.clock->GetCurrentTime(&f_passive_curr_time);
     if (!f_passive_status.ok()) {
       f_passive_ttl = 0;
     }
-    
+
     FileTtlBooster f_passive_ttl_booster(static_cast<uint64_t>(f_passive_curr_time), f_passive_ttl,
                                          vstorage->num_non_empty_levels(), level);
     uint64_t f_passive_ttl_boost_score = (f_passive_ttl > 0) ? f_passive_ttl_booster.GetBoostScore(const_cast<FileMetaData*>(f)) : 1;
     assert(f_passive_ttl_boost_score > 0);
     assert(f_compensated_size != 0);
-    
+
     uint64_t f_passive_score = static_cast<uint64_t>(f_passive_score_raw) * 1024U /
                               f_compensated_size /
                               f_passive_ttl_boost_score;
@@ -2055,7 +2055,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
               // If scores are equal, compare by key (smaller is better)
               return icmp->Compare(a.file->smallest, b.file->smallest) < 0;
             });
-  
+
   int active_rank = 1;
   for (size_t i = 0; i < file_scores.size(); i++) {
     if (file_scores[i].file == &temp_file) {
@@ -2096,7 +2096,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
               // If scores are equal, compare by key (smaller is better)
               return icmp->Compare(a.file->smallest, b.file->smallest) < 0;
             });
-  
+
   int passive_rank = 1;
   for (size_t i = 0; i < file_scores.size(); i++) {
     if (file_scores[i].file == &temp_file) {
@@ -2122,14 +2122,14 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   features->first_passive_rank = passive_rank;
 
   // Calculate normalized ranks
-  // current_file_count 已在条件块外定义
+
   if (current_file_count > 0) {
     features->active_rank_normalized =
         static_cast<double>(features->first_active_rank) / current_file_count;
     features->passive_rank_normalized =
         static_cast<double>(features->first_passive_rank) / current_file_count;
   }
-  
+
   // Validation LOG: Rank calculation
   if (info_log) {
     ROCKS_LOG_INFO(info_log,
@@ -2139,7 +2139,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                    level, current_file_count,
                    features->first_active_rank, features->first_passive_rank,
                    features->active_rank_normalized, features->passive_rank_normalized);
-    
+
     // Validate rank bounds
     if (features->first_active_rank < 1 || features->first_active_rank > current_file_count) {
       ROCKS_LOG_WARN(info_log,
@@ -2171,7 +2171,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   }  // need_rank_effective
 
   // ========== Level State Features (file_count_ratio, level* 17-49) ==========
-  
+
   // Get cumulative_file_count from InternalStats
   InternalStats* internal_stats = cfd->internal_stats();
   uint64_t current_level_cumulative_file_count = current_file_count;
@@ -2221,7 +2221,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     uint64_t total_size = 0;
     try {
       count = vstorage->NumLevelFiles(l);
-      
+
       // Calculate total size for this level
       if (count > 0) {
         try {
@@ -2335,7 +2335,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   }  // need_level
 
   // ========== Key Space Features (11-16 key, 50-55 overlap) ==========
-  
+
   if (need_key_effective) {
   // key_range: Format key range in hex format
   auto SliceToHex = [](const Slice& s) -> std::string {
@@ -2346,14 +2346,14 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     }
     return oss.str();
   };
-  
+
   if (!file_smallest.unset() && !file_largest.unset()) {
     Slice smallest_user_key = file_smallest.user_key();
     Slice largest_user_key = file_largest.user_key();
     std::string smallest_hex = SliceToHex(smallest_user_key);
     std::string largest_hex = SliceToHex(largest_user_key);
     features->key_range = smallest_hex + " .. " + largest_hex;
-    
+
     // If hex string is longer than 16 chars (64 bits), take only the last 16 chars (LSB)
     std::string smallest_hex_truncated = smallest_hex;
     std::string largest_hex_truncated = largest_hex;
@@ -2388,7 +2388,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
       features->key_range_size > 0
           ? std::log10(static_cast<double>(features->key_range_size))
           : std::numeric_limits<double>::quiet_NaN();
-  
+
   // Validation LOG: Key range
   if (info_log) {
     ROCKS_LOG_INFO(info_log,
@@ -2397,7 +2397,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                    " log10_key_range_size=%.6f num_entries=%" PRIu64,
                    level, features->key_range.c_str(), features->key_range_size,
                    features->log10_key_range_size, num_entries);
-    
+
     // Validate key range consistency
     if (features->key_range_size == 0 && num_entries > 0) {
       ROCKS_LOG_WARN(info_log,
@@ -2419,7 +2419,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
         lower_level_files.reserve(100);
         vstorage->GetOverlappingInputs(lower_level, &file_smallest, &file_largest,
                                       &lower_level_files);
-        
+
         lower_level_file_descriptors.reserve(lower_level_files.size());
         for (const FileMetaData* lower_file : lower_level_files) {
           if (lower_file == nullptr) {
@@ -2451,7 +2451,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                         level + 1);
       }
     }
-    
+
     for (const FileDescriptor& lower_fd : lower_level_file_descriptors) {
       try {
         features->overlap_with_lower += lower_fd.GetFileSize();
@@ -2478,7 +2478,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
         upper_level_files.reserve(100);
         vstorage->GetOverlappingInputs(upper_level, &file_smallest, &file_largest,
                                        &upper_level_files);
-        
+
         upper_level_file_descriptors.reserve(upper_level_files.size());
         for (const FileMetaData* upper_file : upper_level_files) {
           if (upper_file == nullptr) {
@@ -2510,7 +2510,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                         level - 1);
       }
     }
-    
+
     for (const FileDescriptor& upper_fd : upper_level_file_descriptors) {
       try {
         features->overlap_with_upper += upper_fd.GetFileSize();
@@ -2540,7 +2540,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
     features->overlap_ratio_with_lower = std::numeric_limits<double>::quiet_NaN();
     features->overlap_ratio_with_upper = std::numeric_limits<double>::quiet_NaN();
   }
-  
+
   // Validation LOG: Overlaps
   if (info_log) {
     ROCKS_LOG_INFO(info_log,
@@ -2554,7 +2554,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                    features->overlap_ratio_with_lower,
                    features->overlap_with_upper, features->overlap_count_with_upper,
                    features->overlap_ratio_with_upper);
-    
+
     // Validate overlap ratios
     if (features->overlap_ratio_with_lower > 1.0 || features->overlap_ratio_with_upper > 1.0) {
       ROCKS_LOG_WARN(info_log,
@@ -2574,7 +2574,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
       continue;
     }
     InternalKey f_smallest_key = f->smallest;
-    
+
     if (f_smallest_key.unset()) {
       continue;
     }
@@ -2600,14 +2600,14 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   };
   NeighborInfo left_neighbor_info = {InternalKey(), InternalKey(), nullptr};
   NeighborInfo right_neighbor_info = {InternalKey(), InternalKey(), nullptr};
-  
+
   for (const auto* other_file : level_files) {
     if (other_file == nullptr) {
       continue;
     }
     InternalKey other_smallest = other_file->smallest;
     InternalKey other_largest = other_file->largest;
-    
+
     if (other_smallest.unset() || other_largest.unset()) {
       continue;
     }
@@ -2627,7 +2627,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
       }
     }
   }
-  
+
   const FileMetaData* left_neighbor = left_neighbor_info.ptr;
   const FileMetaData* right_neighbor = right_neighbor_info.ptr;
 
@@ -2656,7 +2656,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
   } else {
     features->min_neighbor_key_distance = -1.0;
   }
-  
+
   // Calculate average neighbor distance
   if (left_neighbor != nullptr && right_neighbor != nullptr) {
     features->avg_neighbor_key_distance =
@@ -2674,7 +2674,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
 
   if (need_competition) {
   // ========== Competition Features (60-63) ==========
-  
+
   // Count files with better/worse scores
   bool all_active_scores_zero = (features->first_active_score == 0.0);
   for (const auto& info : file_scores) {
@@ -2714,31 +2714,31 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
 
   if (need_other) {
   // ========== Cross Level Features (64-68) ==========
-  
+
   // lower_level_capacity_ratio = lower_level_size / MaxBytesForLevel(lower_level)
   if (level < vstorage->num_levels() - 1) {
     int lower_level = level + 1;
     uint64_t lower_level_size = vstorage->NumLevelBytes(lower_level);
     uint64_t lower_level_max = vstorage->MaxBytesForLevel(lower_level);
     if (lower_level_max > 0) {
-      features->lower_level_capacity_ratio = 
+      features->lower_level_capacity_ratio =
           static_cast<double>(lower_level_size) / static_cast<double>(lower_level_max);
     }
   }
-  
+
   // upper_level_capacity_ratio = upper_level_size / MaxBytesForLevel(upper_level)
   if (level > 0) {
     int upper_level = level - 1;
     uint64_t upper_level_size = vstorage->NumLevelBytes(upper_level);
     uint64_t upper_level_max = vstorage->MaxBytesForLevel(upper_level);
     if (upper_level_max > 0) {
-      features->upper_level_capacity_ratio = 
+      features->upper_level_capacity_ratio =
           static_cast<double>(upper_level_size) / static_cast<double>(upper_level_max);
     }
   }
 
   // ========== Composite Scores ==========
-  
+
   // urgency_score = file_count_ratio * (1 / active_rank_normalized)
   if (features->active_rank_normalized > 0) {
     features->urgency_score = features->file_count_ratio / features->active_rank_normalized;
@@ -2746,10 +2746,10 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
 
   // health_score = 1 / (1 + level_avg_score)
   features->health_score = 1.0 / (1.0 + features->level_avg_score);
-  
+
   // stability_score = 1 / (1 + overlap_ratio_with_lower + overlap_ratio_with_upper)
   features->stability_score = 1.0 / (1.0 + features->overlap_ratio_with_lower + features->overlap_ratio_with_upper);
-  
+
   // Validation LOG: Final summary (simplified for 35-feature model)
   if (info_log) {
     ROCKS_LOG_INFO(info_log,
@@ -2765,7 +2765,7 @@ bool CalculateMLFeaturesBeforeWrite(const InternalKey& smallest,
                    features->level_avg_score, features->urgency_score,
                    features->key_range_size, features->overlap_with_lower,
                    features->overlap_with_upper);
-    
+
     // Validate score ranges
     if (features->first_active_score < 0.0) {
       ROCKS_LOG_WARN(info_log,
@@ -2814,10 +2814,10 @@ namespace {
   std::call_once(g_predictor_init_flag, []() {
     ROCKSDB_NAMESPACE::InitializeMLPredictorByLevel();
   });
-  
+
   // Get the level for this file
   int level = features.creation_level;
-  
+
   // Map level to predictor index:
   // Level 1 -> use Level 1 model
   // Level 2 -> use Level 2 model
@@ -2830,12 +2830,12 @@ namespace {
   if (level_for_predict > 6) {
     level_for_predict = 6;
   }
-  
+
   // Check if level is valid
   if (level < 1) {
     return 0.0;  // Use fallback (level-based hint)
   }
-  
+
   // Convert MLFeatures to array (35 features, reduced from 69) in the exact order used for training
   // Order must match training data (from train_models_35_features.py)
   // Build 35 features array matching the reduced feature set
@@ -2876,30 +2876,30 @@ namespace {
     features.competition_ratio,  // 33
     features.urgency_score,  // 34
   };
-  
+
   // Validate features: NaN, Inf values indicate a problem
   // Log errors but continue to let the problem expose itself
   for (size_t i = 0; i < 35; i++) {
     if (std::isnan(features_array[i])) {
       if (info_log != nullptr) {
-        ROCKS_LOG_ERROR(info_log, "[ML Features] ERROR: NaN detected in feature[%zu] at file_number=%" PRIu64 ", level=%d - WILL PASS TO MODEL", 
+        ROCKS_LOG_ERROR(info_log, "[ML Features] ERROR: NaN detected in feature[%zu] at file_number=%" PRIu64 ", level=%d - WILL PASS TO MODEL",
                         i, file_number, level);
       }
-      fprintf(stderr, "[ML Features] ERROR: NaN detected in feature[%zu] at file_number=%" PRIu64 ", level=%d - WILL PASS TO MODEL\n", 
+      fprintf(stderr, "[ML Features] ERROR: NaN detected in feature[%zu] at file_number=%" PRIu64 ", level=%d - WILL PASS TO MODEL\n",
               i, file_number, level);
       // Continue - let the problem expose itself
     }
     if (std::isinf(features_array[i])) {
       if (info_log != nullptr) {
-        ROCKS_LOG_ERROR(info_log, "[ML Features] ERROR: Inf detected in feature[%zu] at file_number=%" PRIu64 ", level=%d - WILL PASS TO MODEL", 
+        ROCKS_LOG_ERROR(info_log, "[ML Features] ERROR: Inf detected in feature[%zu] at file_number=%" PRIu64 ", level=%d - WILL PASS TO MODEL",
                         i, file_number, level);
       }
-      fprintf(stderr, "[ML Features] ERROR: Inf detected in feature[%zu] at file_number=%" PRIu64 ", level=%d - WILL PASS TO MODEL\n", 
+      fprintf(stderr, "[ML Features] ERROR: Inf detected in feature[%zu] at file_number=%" PRIu64 ", level=%d - WILL PASS TO MODEL\n",
               i, file_number, level);
       // Continue - let the problem expose itself
     }
   }
-  
+
   // Print ML features in the exact order they will be passed to Python model
   // This matches the order in features_level{1,2,3}.txt
   // Format: {"ML_FEATURES_BEFORE_PYTHON": {"file_number": <num>, "level": <level>, "features": {...}}}
@@ -2960,10 +2960,10 @@ namespace {
     oss << "}}}";
     ROCKS_LOG_INFO(info_log, "%s", oss.str().c_str());
   }
-  
+
   // REMOVED - 69-feature logging block (not needed for 35-feature model)
   // The 35 features are already logged in the features_array block above
-  
+
   // ============================================================================
   // CRITICAL: Print features BEFORE passing to Python model
   // This is AFTER all preprocessing (log10 transform, etc.) and BEFORE model input
@@ -3006,7 +3006,7 @@ namespace {
     "competition_ratio",                // 33
     "urgency_score",                    // 34
   };
-  
+
   // ALWAYS print features before model input using RocksDB LOG (writes to db1/LOG)
   if (info_log != nullptr) {
     double min_feature = features_array[0], max_feature = features_array[0];
@@ -3016,40 +3016,40 @@ namespace {
         if (features_array[i] > max_feature) max_feature = features_array[i];
       }
     }
-    
+
     // Log header
     ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL] ==========================================");
     ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL] level=%d, file_number=%" PRIu64, level, file_number);
     ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL] Features (35 features, BEFORE model input):");
-    
+
     // Log each feature
     for (size_t i = 0; i < 35; i++) {
       if (std::isnan(features_array[i]) || std::isinf(features_array[i])) {
-        ROCKS_LOG_ERROR(info_log, "[ML FEATURES TO MODEL] ERROR: Invalid feature[%zu]=%.6f (NaN/Inf) - %s", 
+        ROCKS_LOG_ERROR(info_log, "[ML FEATURES TO MODEL] ERROR: Invalid feature[%zu]=%.6f (NaN/Inf) - %s",
                         i, features_array[i], feature_names_for_print[i]);
       } else {
-        ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL]   [%2zu] %-40s = %15.6f", 
+        ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL]   [%2zu] %-40s = %15.6f",
                        i, feature_names_for_print[i], features_array[i]);
       }
     }
-    
+
     // Log summary
     ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL] Feature range: min=%.6f, max=%.6f", min_feature, max_feature);
     ROCKS_LOG_INFO(info_log, "[ML FEATURES TO MODEL] ==========================================");
   }
-  
-  // Predict using level-specific Python model (69 features) 
+
+  // Predict using level-specific Python model (69 features)
   double predicted_lifetime =
       ROCKSDB_NAMESPACE::PredictFileLifetimePythonByLevel(features_array, 69,
                                                           level_for_predict);
-  
+
   // Log prediction result to db1/LOG
   if (info_log) {
     ROCKS_LOG_INFO(info_log,
                    "[ML Prediction] file_number=%" PRIu64 " level=%d predicted_lifetime=%.6f",
                    file_number, level, predicted_lifetime);
   }
-  
+
   return predicted_lifetime;
 }
 #endif  // ROCKSDB_ML_PREDICT_PYTHON
@@ -3073,7 +3073,7 @@ void MLFeaturesToArray(const MLFeatures& features, double* features_array, size_
   if (array_size < 69) {
     return;  // Array too small
   }
-  
+
   // Rank/Score features (11 features, indices 0-10)
   features_array[0] = static_cast<double>(features.first_active_rank);
   features_array[1] = static_cast<double>(features.first_passive_rank);
@@ -3086,7 +3086,7 @@ void MLFeaturesToArray(const MLFeatures& features, double* features_array, size_
   features_array[8] = features.score_rank_interaction;
   features_array[9] = static_cast<double>(features.rank_difference);
   features_array[10] = features.score_difference;
-  
+
   // Key Range features (6 features, indices 11-16)
   features_array[11] = static_cast<double>(features.key_range_start);
   features_array[12] = static_cast<double>(features.key_range_end);
@@ -3094,7 +3094,7 @@ void MLFeaturesToArray(const MLFeatures& features, double* features_array, size_
   features_array[14] = features.log10_key_range_size;
   features_array[15] = features.key_range_position_in_level;
   features_array[16] = features.key_range_percentile_in_level;
-  
+
   // Level Stats features (33 features, indices 17-49)
   // Level 0
   features_array[17] = static_cast<double>(features.level0_current_file_count);
@@ -3136,7 +3136,7 @@ void MLFeaturesToArray(const MLFeatures& features, double* features_array, size_
   features_array[47] = static_cast<double>(features.level6_cumulative_file_count);
   features_array[48] = static_cast<double>(features.level6_cumulative_trivial_move_count);
   features_array[49] = static_cast<double>(features.level6_total_size);
-  
+
   // Overlap features (6 features, indices 50-55)
   features_array[50] = static_cast<double>(features.overlap_with_lower);
   features_array[51] = static_cast<double>(features.overlap_with_upper);
@@ -3144,19 +3144,19 @@ void MLFeaturesToArray(const MLFeatures& features, double* features_array, size_
   features_array[53] = static_cast<double>(features.overlap_count_with_upper);
   features_array[54] = features.overlap_ratio_with_lower;
   features_array[55] = features.overlap_ratio_with_upper;
-  
+
   // Neighbor features (4 features, indices 56-59)
   features_array[56] = features.left_neighbor_key_distance;
   features_array[57] = features.right_neighbor_key_distance;
   features_array[58] = features.min_neighbor_key_distance;
   features_array[59] = features.avg_neighbor_key_distance;
-  
+
   // Competition features (4 features, indices 60-63)
   features_array[60] = static_cast<double>(features.better_score_files_count);
   features_array[61] = static_cast<double>(features.worse_score_files_count);
   features_array[62] = features.competition_ratio;
   features_array[63] = static_cast<double>(features.neighbor_files_count);
-  
+
   // Other features (5 features, indices 64-68)
   features_array[64] = features.lower_level_capacity_ratio;
   features_array[65] = features.upper_level_capacity_ratio;
@@ -3227,7 +3227,7 @@ double PredictFileLifetimePythonByLevel(const double* features,
   // CRITICAL: Acquire GIL for thread-safe Python calls
   // RocksDB compaction runs in background threads, so we must acquire GIL
   PyGILState_STATE gstate = PyGILState_Ensure();
-  
+
   PyObject* features_list = nullptr;
   PyObject* level_obj = nullptr;
   PyObject* args = nullptr;
@@ -3242,7 +3242,7 @@ double PredictFileLifetimePythonByLevel(const double* features,
     PyGILState_Release(gstate);
     return -1.0;
   }
-  
+
   for (size_t i = 0; i < feature_count; ++i) {
     PyObject* item = PyFloat_FromDouble(features[i]);
     if (!item) {
@@ -3264,7 +3264,7 @@ double PredictFileLifetimePythonByLevel(const double* features,
     PyGILState_Release(gstate);
     return -1.0;
   }
-  
+
   args = PyTuple_New(2);
   if (!args) {
     fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: PyTuple_New failed\n");
@@ -3274,16 +3274,16 @@ double PredictFileLifetimePythonByLevel(const double* features,
     PyGILState_Release(gstate);
     return -1.0;
   }
-  
+
   PyTuple_SetItem(args, 0, features_list);  // features first (matching Python function signature)
   PyTuple_SetItem(args, 1, level_obj);  // level second
 
   result = PyObject_CallObject(g_predict_func, args);
-  
+
   Py_DECREF(args);
 
   if (!result) {
-    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: Python调用失败！\n");
+    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: Python call failed\n");
     fflush(stderr);
     if (PyErr_Occurred()) {
       PyErr_Print();
@@ -3294,9 +3294,9 @@ double PredictFileLifetimePythonByLevel(const double* features,
   }
 
   predicted_lifetime = PyFloat_AsDouble(result);
-  
+
   if (PyErr_Occurred()) {
-    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: 返回值转换时发生Python错误！\n");
+    fprintf(stderr, "[ERROR] PredictFileLifetimePythonByLevel: failed to convert Python return value\n");
     fflush(stderr);
     PyErr_Print();
     PyErr_Clear();
@@ -3304,10 +3304,10 @@ double PredictFileLifetimePythonByLevel(const double* features,
     PyGILState_Release(gstate);
     return -1.0;
   }
-  
+
   Py_DECREF(result);
   PyGILState_Release(gstate);
-  
+
   return predicted_lifetime;
 }
 #endif  // ROCKSDB_ML_PREDICT_PYTHON

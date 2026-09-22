@@ -19,10 +19,10 @@
 namespace ROCKSDB_NAMESPACE {
 
 class CompactionOutputs;
-// CompactionFileOpenFunc: 打开新的 compaction 输出文件
-// 参数：
-//   - CompactionOutputs&: 输出文件管理器
-//   - const Slice&: 文件的第一个 key（即 smallest，100% 精确）
+
+
+
+
 using CompactionFileOpenFunc = std::function<Status(CompactionOutputs&, const Slice&)>;
 using CompactionFileCloseFunc =
     std::function<Status(const Status&, const ParsedInternalKey&, const Slice&,

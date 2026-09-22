@@ -1549,19 +1549,19 @@ Status DBImpl::RewriteFileAtomically(const std::string& source_path,
                                      uint64_t expected_size,
                                      Env::WriteLifeTimeHint write_hint) {
   mutex_.AssertHeld();
-  
+
   FileSystem* fs = immutable_db_options_.fs.get();
   const IOOptions io_options;
   IODebugContext* dbg = nullptr;
-  
+
   // Open source file for reading
   std::unique_ptr<FSRandomAccessFile> source_file;
   Status s = fs->NewRandomAccessFile(source_path, FileOptions(), &source_file, dbg);
   if (!s.ok()) {
     return s;
   }
-  
-  // Open temp file for writing（使用目标 level 的 handle 以便底层按冷热放置）
+
+
   FileOptions write_opts;
   write_opts.write_hint = write_hint;
   std::unique_ptr<FSWritableFile> temp_file;
@@ -1569,48 +1569,48 @@ Status DBImpl::RewriteFileAtomically(const std::string& source_path,
   if (!s.ok()) {
     return s;
   }
-  
+
   // Read and write in chunks to avoid loading entire file into memory
   const size_t chunk_size = 64 * 1024;  // 64KB chunks
   std::unique_ptr<char[]> buffer(new char[chunk_size]);
   uint64_t total_read = 0;
   uint64_t total_written = 0;
-  
+
   while (total_read < expected_size) {
     size_t to_read = static_cast<size_t>(
         std::min(static_cast<uint64_t>(chunk_size), expected_size - total_read));
-    
+
     Slice result;
-    s = source_file->Read(total_read, to_read, io_options, &result, 
+    s = source_file->Read(total_read, to_read, io_options, &result,
                           buffer.get(), dbg);
     if (!s.ok()) {
       temp_file->Close(IOOptions(), dbg);
       fs->DeleteFile(temp_path, IOOptions(), dbg);
       return s;
     }
-    
+
     if (result.size() == 0) {
       break;  // EOF
     }
-    
+
     s = temp_file->Append(result, io_options, dbg);
     if (!s.ok()) {
       temp_file->Close(IOOptions(), dbg);
       fs->DeleteFile(temp_path, IOOptions(), dbg);
       return s;
     }
-    
+
     total_read += result.size();
     total_written += result.size();
   }
-  
+
   // Verify file size
   if (total_written != expected_size) {
     temp_file->Close(IOOptions(), dbg);
     fs->DeleteFile(temp_path, IOOptions(), dbg);
     return Status::Corruption("File size mismatch during rewrite");
   }
-  
+
   // Sync and close temp file
   s = temp_file->Sync(io_options, dbg);
   if (!s.ok()) {
@@ -1618,20 +1618,20 @@ Status DBImpl::RewriteFileAtomically(const std::string& source_path,
     fs->DeleteFile(temp_path, IOOptions(), dbg);
     return s;
   }
-  
+
   s = temp_file->Close(IOOptions(), dbg);
   if (!s.ok()) {
     fs->DeleteFile(temp_path, IOOptions(), dbg);
     return s;
   }
-  
+
   // Atomically replace source file with temp file
   s = fs->RenameFile(temp_path, source_path, IOOptions(), dbg);
   if (!s.ok()) {
     fs->DeleteFile(temp_path, IOOptions(), dbg);
     return s;
   }
-  
+
   return Status::OK();
 }
 
@@ -1763,7 +1763,7 @@ Status DBImpl::CompactFilesImpl(
           log_buffer,
           "[%s] Trivial move succeeded for %zu files, %zu bytes total\n",
           c->column_family_data()->GetName().c_str(), moved_files, moved_bytes);
-      
+
       // Update CustomCompactionPriManager state after trivial move completes
       if (status.ok() && CustomCompactionPriManager::IsEnabled() &&
           g_custom_compaction_pri_manager != nullptr && c != nullptr) {

@@ -486,15 +486,15 @@ class CompactionJob {
 
   uint64_t GetCompactionId(SubcompactionState* sub_compact) const;
 
-  // 仅收集 69 维特征并打 [ML_FEATURES] 日志，不预测、不重写。由 ROCKSDB_COLLECT_FEATURES=1 或 ROCKSDB_ML_COLLECT_ONLY=1 独立控制。
+
   void LogMLFeaturesForCollection(uint64_t file_number, int output_level,
                                   const InternalKey& smallest,
                                   const InternalKey& largest,
                                   uint64_t current_entries, uint64_t file_size,
                                   ColumnFamilyData* cfd);
 
-  // 解耦封装：根据环境变量返回 compaction 输出的 target handle。
-  // Phase2：GetTargetHandleForCompactionOutputMetadata（HASH_HANDLE：0/1/2/no-fdp/3=native-base=Optimized 分档）；ML 开时 MapLifetimeToHandle。
+
+
   int GetTargetHandleForCompactionOutput(uint64_t file_number, int output_level,
                                          const double* feature_array,
                                          size_t feature_len);

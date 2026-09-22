@@ -154,8 +154,8 @@ Compaction* CustomCompactionPicker::SelectFileFromPriorityQueue(
     const std::string& full_history_ts_low,
     uint64_t file_number, int level,
     CompactionReason compaction_reason, double compaction_score) {
-  
-  // 在 vstorage 中查找文件
+
+
   FileMetaData* file_meta = nullptr;
   int actual_level = level;
   for (int l = 0; l < vstorage->num_levels(); ++l) {
@@ -163,7 +163,7 @@ Compaction* CustomCompactionPicker::SelectFileFromPriorityQueue(
     for (FileMetaData* f : files) {
       if (f->fd.GetNumber() == file_number) {
         file_meta = f;
-        actual_level = l;  // 更新实际的 level
+        actual_level = l;
         break;
       }
     }
@@ -171,112 +171,112 @@ Compaction* CustomCompactionPicker::SelectFileFromPriorityQueue(
       break;
     }
   }
-  
+
   if (file_meta == nullptr) {
     if (ioptions_.info_log) {
       ROCKS_LOG_ERROR(ioptions_.info_log,
-                     "[CustomCompactionPicker] 错误: 文件 #%" PRIu64 " 未找到 (level %d)",
+                     "[CustomCompactionPicker] ERROR: file #%" PRIu64 " not found (level %d)",
                      file_number, level);
     }
     return nullptr;
   }
-  
-  // 检查文件是否正在被 Compaction
+
+
   if (file_meta->being_compacted) {
     if (ioptions_.info_log) {
       ROCKS_LOG_INFO(ioptions_.info_log,
-                     "[CustomCompactionPicker] 警告: 文件 #%" PRIu64 " 正在被 Compaction (level %d)",
+                     "[CustomCompactionPicker] WARNING: file #%" PRIu64 " is being compacted (level %d)",
                      file_number, actual_level);
     }
     return nullptr;
   }
-  
-  // 确定输出 level
+
+
   int output_level = (actual_level == 0) ? vstorage->base_level() : actual_level + 1;
   if (output_level >= vstorage->num_levels()) {
     output_level = vstorage->num_levels() - 1;
   }
-  
-  // ========== 第一部分：选择这一层的文件（仿照 RocksDB 正常逻辑）==========
-  // 以"太远"的文件为起点，然后像正常compaction一样扩展
+
+
+
   CompactionInputFiles start_level_inputs;
   start_level_inputs.level = actual_level;
   start_level_inputs.files.push_back(file_meta);
-  
-  // 像正常compaction一样扩展文件（ExpandInputsToCleanCut）
-  // 这样可以动态调整，避免重叠，就像正常compaction一样
+
+
+
   if (!ExpandInputsToCleanCut(cf_name, vstorage,
                               &start_level_inputs)) {
     if (ioptions_.info_log) {
       ROCKS_LOG_INFO(ioptions_.info_log,
-                     "[CustomCompactionPicker] ExpandInputsToCleanCut 失败: file #%" PRIu64 " level=%d",
+                     "[CustomCompactionPicker] ExpandInputsToCleanCut failed: file #%" PRIu64 " level=%d",
                      file_number, actual_level);
     }
     return nullptr;
   }
-  
-  // ========== 第二部分：设置下一层的输入文件（完全按照 RocksDB 的 SetupOtherInputsIfNeeded）==========
+
+
   CompactionInputFiles output_level_inputs;
   output_level_inputs.level = output_level;
   int parent_index = -1;
   int base_index = -1;
-  
-  // 与正常compaction一致：如果是L0->base_level compaction，需要设置其他L0文件
-  // 正常compaction: SetupOtherL0FilesIfNeeded() -> GetOverlappingL0Files()
-  // 正常compaction检查: if (start_level_ == 0 && output_level_ != 0 && !is_l0_trivial_move_)
-  // 对于自定义compaction，我们检查是否可以trivial move（只有一个文件且没有输出层文件）
-  // 注意：正常compaction的is_l0_trivial_move_是在TryPickL0TrivialMove()中设置的
-  // 但自定义compaction在创建Compaction对象时，IsTrivialMove()会在BackgroundCompaction中被调用
-  // 这里保守地假设不是trivial move，与正常compaction的默认行为一致
+
+
+
+
+
+
+
+
   bool is_l0_trivial_move = false;
   if (actual_level == 0 && output_level != 0 && !is_l0_trivial_move) {
-    // 调用GetOverlappingL0Files来添加其他L0文件（与正常compaction一致）
+
     if (!GetOverlappingL0Files(vstorage, &start_level_inputs, output_level, &parent_index)) {
       if (ioptions_.info_log) {
         ROCKS_LOG_INFO(ioptions_.info_log,
-                       "[CustomCompactionPicker] GetOverlappingL0Files 失败: file #%" PRIu64 " level=%d->%d",
+                       "[CustomCompactionPicker] GetOverlappingL0Files failed: file #%" PRIu64 " level=%d->%d",
                        file_number, actual_level, output_level);
       }
       return nullptr;
     }
   }
-  
+
   if (output_level != 0) {
-    // 在调用 SetupOtherInputs 之前，先快速检查下一层的重叠文件是否在compaction
-    // 这样可以提前过滤掉不可用的文件，避免浪费时间和资源
+
+
     InternalKey smallest, largest;
     GetRange(start_level_inputs, &smallest, &largest);
     std::vector<FileMetaData*> overlapping_files;
     int temp_parent_index = -1;
     vstorage->GetOverlappingInputs(output_level, &smallest, &largest,
                                    &overlapping_files, -1, &temp_parent_index);
-    
-    // 快速检查：如果下一层的重叠文件正在被compaction，直接返回nullptr
+
+
     if (AreFilesInCompaction(overlapping_files)) {
       if (ioptions_.info_log) {
         ROCKS_LOG_INFO(ioptions_.info_log,
-                       "[CustomCompactionPicker] 下一层重叠文件正在被 compaction: file #%" PRIu64 " level=%d->%d, output_level_files=%zu",
+                       "[CustomCompactionPicker] overlapping next-level file is being compacted: file #%" PRIu64 " level=%d->%d, output_level_files=%zu",
                        file_number, actual_level, output_level, overlapping_files.size());
       }
       return nullptr;
     }
-    
-    // 完全按照 RocksDB 的 SetupOtherInputsIfNeeded 逻辑
-    // 检查是否需要round-robin扩展（与正常compaction一致）
+
+
+
     bool round_robin_expanding =
         ioptions_.compaction_pri == kRoundRobin &&
         (compaction_reason == CompactionReason::kLevelMaxLevelSize ||
          compaction_reason == CompactionReason::kLevelTooFarFiles);
-    // 注意：正常compaction在round_robin_expanding时会调用SetupOtherFilesWithRoundRobinExpansion()
-    // 但这是LevelCompactionBuilder的私有方法，我们无法直接调用
-    // 不过SetupOtherInputs会处理round_robin_expanding的情况
-    
-    // 调用 SetupOtherInputs（内部会处理重叠文件、扩展、being_compacted检查等）
+
+
+
+
+
     if (!SetupOtherInputs(cf_name, mutable_cf_options, vstorage,
                           &start_level_inputs, &output_level_inputs,
                           &parent_index, base_index, round_robin_expanding)) {
-      // 详细诊断：检查失败原因
-      // 先获取重叠文件（但不检查being_compacted）
+
+
       CompactionInputFiles temp_output_inputs;
       temp_output_inputs.level = output_level;
       InternalKey temp_smallest, temp_largest;
@@ -285,52 +285,52 @@ Compaction* CustomCompactionPicker::SelectFileFromPriorityQueue(
       vstorage->GetOverlappingInputs(output_level, &temp_smallest, &temp_largest,
                                      &temp_output_inputs.files, -1,
                                      &temp_parent_index2);
-      
-      // 检查是否有文件正在被compaction
+
+
       bool has_files_in_compaction = AreFilesInCompaction(temp_output_inputs.files);
-      
+
       if (ioptions_.info_log) {
         ROCKS_LOG_INFO(ioptions_.info_log,
-                       "[CustomCompactionPicker] SetupOtherInputs 失败: file #%" PRIu64 " level=%d->%d, output_level_files=%zu, has_files_in_compaction=%d",
+                       "[CustomCompactionPicker] SetupOtherInputs failed: file #%" PRIu64 " level=%d->%d, output_level_files=%zu, has_files_in_compaction=%d",
                        file_number, actual_level, output_level, temp_output_inputs.files.size(), has_files_in_compaction ? 1 : 0);
       }
       return nullptr;
     }
-    
-    // 构建 compaction_inputs（完全按照 RocksDB 的 SetupOtherInputsIfNeeded）
-    // 注意：这里先构建用于检查重叠，但会在第三部分重新构建用于创建Compaction对象
+
+
+
     std::vector<CompactionInputFiles> temp_compaction_inputs = {start_level_inputs};
     if (!output_level_inputs.empty()) {
       temp_compaction_inputs.push_back(output_level_inputs);
     }
-    
-    // 检查是否与正在运行的 compaction 重叠（完全按照 RocksDB 的 SetupOtherInputsIfNeeded）
+
+
     int proximal_level = Compaction::EvaluateProximalLevel(vstorage, mutable_cf_options,
                                                            ioptions_, actual_level,
                                                            output_level);
     if (FilesRangeOverlapWithCompaction(temp_compaction_inputs, output_level, proximal_level)) {
       if (ioptions_.info_log) {
         ROCKS_LOG_INFO(ioptions_.info_log,
-                       "[CustomCompactionPicker] 与正在运行的 compaction 重叠: file #%" PRIu64 " (level %d->%d)",
+                       "[CustomCompactionPicker] overlaps an active compaction: file #%" PRIu64 " (level %d->%d)",
                        file_number, actual_level, output_level);
       }
       return nullptr;
     }
-    
-    // 获取 grandparents（完全按照 RocksDB 的 SetupOtherInputsIfNeeded）
-    // 注意：这里先获取，但会在后面用于创建 Compaction 对象
+
+
+
   } else {
-    // output_level == 0 的情况（完全按照 RocksDB 的 SetupOtherInputsIfNeeded）
-    // compaction_inputs 只包含 start_level_inputs
+
+
   }
-  
-  // ========== 第三部分：构建 compaction_inputs 和获取 grandparents（完全按照 RocksDB 的 GetCompaction）==========
-  // 与正常compaction一致：在GetCompaction()中构建compaction_inputs_
-  // 安全检查：确保start_level_inputs不为空
+
+
+
+
   if (start_level_inputs.files.empty()) {
     if (ioptions_.info_log) {
       ROCKS_LOG_WARN(ioptions_.info_log,
-                     "[CustomCompactionPicker] start_level_inputs为空，返回nullptr: file #%" PRIu64 " level=%d",
+                     "[CustomCompactionPicker] start_level_inputs is empty; returning nullptr: file #%" PRIu64 " level=%d",
                      file_number, actual_level);
     }
     return nullptr;
@@ -339,37 +339,37 @@ Compaction* CustomCompactionPicker::SelectFileFromPriorityQueue(
   if (!output_level_inputs.empty()) {
     compaction_inputs.push_back(output_level_inputs);
   }
-  
+
   std::vector<FileMetaData*> grandparents;
-  // 与正常compaction一致：只在非trivial move时获取grandparents
-  // 正常compaction: if (!is_l0_trivial_move_) { GetGrandparents(...); }
-  // 注意：使用与GetOverlappingL0Files相同的is_l0_trivial_move判断（保守地假设不是trivial move）
+
+
+
   if (output_level != 0 && !is_l0_trivial_move) {
     GetGrandparents(vstorage, start_level_inputs, output_level_inputs, &grandparents);
   }
-  
-  // 计算文件大小限制
+
+
   uint64_t max_file_size = MaxFileSizeForLevel(
       mutable_cf_options, output_level, ioptions_.compaction_style,
       vstorage->base_level(), ioptions_.level_compaction_dynamic_level_bytes);
-  
-  // 获取路径 ID（完全按照 RocksDB 的 GetPathId 逻辑）
-  // 复制 LevelCompactionBuilder::GetPathId 的实现
+
+
+
   uint32_t path_id = 0;
-  // 与正常compaction一致：如果cf_paths为空，应该assert失败（但这里我们允许为空，返回0）
-  // 正常compaction: assert(!ioptions.cf_paths.empty());
+
+
   if (!ioptions_.cf_paths.empty()) {
     uint32_t p = 0;
     // size remaining in the most recent path
     uint64_t current_path_size = ioptions_.cf_paths[0].target_size;
-    
+
     uint64_t level_size;
     int cur_level = 0;
-    
+
     // max_bytes_for_level_base denotes L1 size.
     // We estimate L0 size to be the same as L1.
     level_size = mutable_cf_options.max_bytes_for_level_base;
-    
+
     // Last path is the fallback
     while (p < ioptions_.cf_paths.size() - 1) {
       if (level_size <= current_path_size) {
@@ -399,39 +399,39 @@ Compaction* CustomCompactionPicker::SelectFileFromPriorityQueue(
         }
       }
       p++;
-      // 与正常compaction一致：在循环内p++之后设置current_path_size
-      // 循环条件是 p < cf_paths.size() - 1，所以p++后p <= cf_paths.size() - 1，访问是安全的
+
+
       current_path_size = ioptions_.cf_paths[p].target_size;
     }
-    // 如果循环结束还没找到，使用最后一个path（与正常compaction一致：return p）
+
     path_id = p;
   }
-  
-  // 获取压缩类型和选项
+
+
   CompressionType compression_type = GetCompressionType(
       vstorage, mutable_cf_options, output_level, vstorage->base_level());
   CompressionOptions compression_opts = GetCompressionOptions(
       mutable_cf_options, vstorage, output_level);
-  
-  // 使用传入的compaction_reason和score（与normal_compaction保持一致）
-  // 注意：score已经在PickCompaction中从normal_compaction获取，这里直接使用传入的值
-  
-  // 计算l0_files_might_overlap（与正常compaction逻辑一致）
-  // 正常compaction: start_level_ == 0 && !is_l0_trivial_move_ && (compaction_inputs_.size() > 1 || compaction_inputs_[0].size() > 1)
-  // 注意：is_l0_trivial_move已经在函数开始处声明（第468行），这里直接使用
-  // 对于自定义compaction，我们保守地假设不是trivial move，与正常compaction的默认行为一致
-  // 安全检查：确保compaction_inputs不为空
+
+
+
+
+
+
+
+
+
   if (compaction_inputs.empty()) {
     if (ioptions_.info_log) {
       ROCKS_LOG_WARN(ioptions_.info_log,
-                     "[CustomCompactionPicker] compaction_inputs为空，返回nullptr: file #%" PRIu64 " level=%d",
+                     "[CustomCompactionPicker] compaction_inputs is empty; returning nullptr: file #%" PRIu64 " level=%d",
                      file_number, actual_level);
     }
     return nullptr;
   }
   bool l0_files_might_overlap = (actual_level == 0 && !is_l0_trivial_move &&
                                   (compaction_inputs.size() > 1 || compaction_inputs[0].size() > 1));
-  
+
   auto c = new Compaction(
       vstorage, ioptions_, mutable_cf_options, mutable_db_options,
       std::move(compaction_inputs), output_level,
@@ -440,16 +440,16 @@ Compaction* CustomCompactionPicker::SelectFileFromPriorityQueue(
       Temperature::kUnknown,
       /* max_subcompactions */ 0, std::move(grandparents),
       /* earliest_snapshot */ std::nullopt, /* snapshot_checker */ nullptr,
-      compaction_reason,  // 使用传入的compaction_reason（与normal_compaction一致）
+      compaction_reason,
       /* trim_ts */ "", compaction_score, l0_files_might_overlap);
-  
-  // 注册 Compaction
+
+
   RegisterCompaction(c);
-  
-  // 重新计算 compaction score
+
+
   vstorage->ComputeCompactionScore(ioptions_, mutable_cf_options,
                                    full_history_ts_low);
-  
+
   if (ioptions_.info_log) {
     ROCKS_LOG_INFO(ioptions_.info_log,
                    "[CustomCompactionPicker] Created compaction: level %d -> %d, file #%" PRIu64
@@ -459,7 +459,7 @@ Compaction* CustomCompactionPicker::SelectFileFromPriorityQueue(
                    output_level_inputs.files.size(),
                    grandparents.size());
   }
-  
+
   return c;
 }
 

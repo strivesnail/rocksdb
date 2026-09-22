@@ -92,8 +92,8 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
             << Slice(file_checksum).ToString(true) << "file_checksum_func_name"
             << file_checksum_func_name << "smallest_seqno" << fd.smallest_seqno
             << "largest_seqno" << fd.largest_seqno;
-    
-    // 在JSON日志中也添加level信息（如果有效）
+
+
     if (level >= 0) {
       jwriter << "level" << level;
     }

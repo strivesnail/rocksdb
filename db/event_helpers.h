@@ -36,7 +36,7 @@ class EventHelpers {
       TableFileCreationReason reason, const Status& s,
       const std::string& file_checksum,
       const std::string& file_checksum_func_name,
-      int level = -1);  // level参数，-1表示未知
+      int level = -1);
   static void LogAndNotifyTableFileDeletion(
       EventLogger* event_logger, int job_id, uint64_t file_number,
       const std::string& file_path, const Status& status,

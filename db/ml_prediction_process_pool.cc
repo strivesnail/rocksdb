@@ -21,7 +21,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// 全局进程池实例
+
 std::unique_ptr<MLPredictionProcessPool> g_ml_prediction_pool;
 
 MLPredictionProcessPool::MLPredictionProcessPool()
@@ -38,16 +38,16 @@ Status MLPredictionProcessPool::Initialize(int num_workers) {
   }
 
   if (num_workers <= 0) {
-    num_workers = 2;  // 默认 2 个工作进程
+    num_workers = 2;
   }
   if (num_workers > 8) {
-    num_workers = 8;  // 最多 8 个工作进程
+    num_workers = 8;
   }
 
   num_workers_ = num_workers;
   workers_.resize(num_workers_);
 
-  // 创建工作进程
+
   for (int i = 0; i < num_workers_; ++i) {
     Status s = CreateWorkerProcess(i, &workers_[i]);
     if (!s.ok()) {
@@ -67,16 +67,16 @@ void MLPredictionProcessPool::Shutdown() {
 
   initialized_.store(false);
 
-  // 关闭所有工作进程
+
   for (auto& worker : workers_) {
     if (worker.active && worker.pid > 0) {
-      // 关闭管道
+
       if (worker.request_pipe[0] >= 0) close(worker.request_pipe[0]);
       if (worker.request_pipe[1] >= 0) close(worker.request_pipe[1]);
       if (worker.response_pipe[0] >= 0) close(worker.response_pipe[0]);
       if (worker.response_pipe[1] >= 0) close(worker.response_pipe[1]);
-      
-      // 等待子进程退出
+
+
       if (kill(worker.pid, SIGTERM) == 0) {
         int status;
         waitpid(worker.pid, &status, 0);
@@ -91,19 +91,19 @@ void MLPredictionProcessPool::Shutdown() {
 }
 
 Status MLPredictionProcessPool::CreateWorkerProcess(int worker_id, WorkerProcess* worker) {
-  // 创建请求管道（父进程写，子进程读）
+
   if (pipe(worker->request_pipe) != 0) {
     return Status::IOError("Failed to create request pipe", strerror(errno));
   }
 
-  // 创建响应管道（子进程写，父进程读）
+
   if (pipe(worker->response_pipe) != 0) {
     close(worker->request_pipe[0]);
     close(worker->request_pipe[1]);
     return Status::IOError("Failed to create response pipe", strerror(errno));
   }
 
-  // Fork 子进程
+
   pid_t pid = fork();
   if (pid < 0) {
     close(worker->request_pipe[0]);
@@ -114,20 +114,20 @@ Status MLPredictionProcessPool::CreateWorkerProcess(int worker_id, WorkerProcess
   }
 
   if (pid == 0) {
-    // 子进程：关闭不需要的管道端
-    close(worker->request_pipe[1]);  // 关闭写端
-    close(worker->response_pipe[0]); // 关闭读端
-    
-    // 运行工作进程主函数
+
+    close(worker->request_pipe[1]);
+    close(worker->response_pipe[0]);
+
+
     WorkerMain(worker_id, worker->request_pipe[0], worker->response_pipe[1]);
-    
-    // WorkerMain 不应该返回，如果返回了则退出
+
+
     _exit(1);
   } else {
-    // 父进程：关闭不需要的管道端
-    close(worker->request_pipe[0]);  // 关闭读端
-    close(worker->response_pipe[1]); // 关闭写端
-    
+
+    close(worker->request_pipe[0]);
+    close(worker->response_pipe[1]);
+
     worker->pid = pid;
     worker->active = true;
     return Status::OK();
@@ -136,18 +136,18 @@ Status MLPredictionProcessPool::CreateWorkerProcess(int worker_id, WorkerProcess
 
 void MLPredictionProcessPool::WorkerMain(int /*worker_id*/, int request_fd, int response_fd) {
 #ifdef ROCKSDB_ML_PREDICT_PYTHON
-  // 忽略 SIGPIPE（管道关闭时的信号）
+
   signal(SIGPIPE, SIG_IGN);
-  
-  // 初始化 Python（每个工作进程独立的解释器）
+
+
   if (!Py_IsInitialized()) {
     Py_Initialize();
     if (!Py_IsInitialized()) {
-      return;  // Python 初始化失败
+      return;
     }
   }
 
-  // 设置环境变量
+
   const char* models_path = std::getenv("ROCKSDB_ML_MODELS_PATH");
   if (models_path) {
     PyObject* env_dict = PySys_GetObject("environ");
@@ -162,7 +162,7 @@ void MLPredictionProcessPool::WorkerMain(int /*worker_id*/, int request_fd, int 
     }
   }
 
-  // 添加 tools 路径到 sys.path
+
   const char* tools_path = std::getenv("ROCKSDB_TOOLS_PATH");
   if (tools_path) {
     PyObject* sys_path = PySys_GetObject("path");
@@ -175,14 +175,14 @@ void MLPredictionProcessPool::WorkerMain(int /*worker_id*/, int request_fd, int 
     }
   }
 
-  // 导入 Python 模块
+
   PyObject* module = PyImport_ImportModule("ml_predict_lifetime_by_level");
   if (!module) {
     PyErr_Print();
     return;
   }
 
-  // 获取预测函数
+
   PyObject* predict_func = PyObject_GetAttrString(module, "predict_file_lifetime_by_level");
   if (!predict_func || !PyCallable_Check(predict_func)) {
     Py_XDECREF(predict_func);
@@ -190,7 +190,7 @@ void MLPredictionProcessPool::WorkerMain(int /*worker_id*/, int request_fd, int 
     return;
   }
 
-  // 调用 initialize() 加载模型
+
   PyObject* init_func = PyObject_GetAttrString(module, "initialize");
   if (init_func && PyCallable_Check(init_func)) {
     PyObject* result = PyObject_CallObject(init_func, nullptr);
@@ -198,16 +198,16 @@ void MLPredictionProcessPool::WorkerMain(int /*worker_id*/, int request_fd, int 
   }
   Py_XDECREF(init_func);
 
-  // 主循环：读取请求，执行预测，返回结果
+
   while (true) {
-    // 读取请求
+
     PredictionRequest request;
     ssize_t n = read(request_fd, &request.request_id, sizeof(request.request_id));
     if (n <= 0) {
-      break;  // 管道关闭或错误
+      break;
     }
     if (n != sizeof(request.request_id)) {
-      break;  // 读取不完整
+      break;
     }
 
     n = read(request_fd, &request.level, sizeof(request.level));
@@ -218,7 +218,7 @@ void MLPredictionProcessPool::WorkerMain(int /*worker_id*/, int request_fd, int 
     if (n <= 0 || n != sizeof(feature_count)) break;
 
     if (feature_count == 0 || feature_count > 1000) {
-      // 无效的特征数量，发送错误响应
+
       PredictionResponse error_response(request.request_id, 0.0, false);
       ssize_t written = write(response_fd, &error_response.request_id, sizeof(error_response.request_id));
       if (written != sizeof(error_response.request_id)) break;
@@ -233,12 +233,12 @@ void MLPredictionProcessPool::WorkerMain(int /*worker_id*/, int request_fd, int 
     n = read(request_fd, request.features.data(), feature_count * sizeof(double));
     if (n <= 0 || n != static_cast<ssize_t>(feature_count * sizeof(double))) break;
 
-    // 执行预测
+
     double predicted_lifetime = 0.0;
     bool success = false;
 
-    if (feature_count == 69) {  // 验证特征数量
-      // 构建 Python 参数
+    if (feature_count == 69) {
+
       PyObject* features_list = PyList_New(feature_count);
       if (features_list) {
         for (size_t i = 0; i < feature_count; ++i) {
@@ -270,7 +270,7 @@ void MLPredictionProcessPool::WorkerMain(int /*worker_id*/, int request_fd, int 
       }
     }
 
-    // 发送响应
+
     PredictionResponse response(request.request_id, predicted_lifetime, success);
     ssize_t written = write(response_fd, &response.request_id, sizeof(response.request_id));
     if (written != sizeof(response.request_id)) break;
@@ -280,12 +280,12 @@ void MLPredictionProcessPool::WorkerMain(int /*worker_id*/, int request_fd, int 
     if (written != sizeof(response.success)) break;
   }
 
-  // 清理
+
   Py_DECREF(predict_func);
   Py_DECREF(module);
   Py_Finalize();
 #else
-  // 在没有 Python 支持的情况下，这些参数未使用
+
   (void)request_fd;
   (void)response_fd;
 #endif
@@ -297,8 +297,8 @@ Status MLPredictionProcessPool::SendRequest(int worker_id, const PredictionReque
   }
 
   const WorkerProcess& worker = workers_[worker_id];
-  
-  // 写入请求
+
+
   ssize_t n = write(worker.request_pipe[1], &request.request_id, sizeof(request.request_id));
   if (n != sizeof(request.request_id)) {
     return Status::IOError("Failed to write request_id");
@@ -330,7 +330,7 @@ Status MLPredictionProcessPool::ReceiveResponse(int worker_id, PredictionRespons
 
   const WorkerProcess& worker = workers_[worker_id];
 
-  // 读取响应
+
   ssize_t n = read(worker.response_pipe[0], &response->request_id, sizeof(response->request_id));
   if (n != sizeof(response->request_id)) {
     return Status::IOError("Failed to read request_id");
@@ -350,7 +350,7 @@ Status MLPredictionProcessPool::ReceiveResponse(int worker_id, PredictionRespons
 }
 
 int MLPredictionProcessPool::SelectWorker() {
-  // 简单的轮询选择
+
   int worker = current_worker_.fetch_add(1) % num_workers_;
   return worker;
 }
@@ -360,20 +360,20 @@ double MLPredictionProcessPool::Predict(int level, const double* features, size_
     return 0.0;
   }
 
-  // 选择工作进程
+
   int worker_id = SelectWorker();
 
-  // 创建请求
+
   uint64_t request_id = next_request_id_.fetch_add(1);
   PredictionRequest request(request_id, level, std::vector<double>(features, features + feature_count));
 
-  // 发送请求
+
   Status s = SendRequest(worker_id, request);
   if (!s.ok()) {
     return 0.0;
   }
 
-  // 接收响应
+
   PredictionResponse response;
   s = ReceiveResponse(worker_id, &response);
   if (!s.ok() || !response.success || response.request_id != request_id) {

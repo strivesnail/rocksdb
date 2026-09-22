@@ -1,8 +1,8 @@
-"""共享的 scaler 工具，供训练脚本和 ml_predict 使用"""
+"""Shared scaler utilities for training and prediction."""
 
 
 class NoScaler:
-    """不做任何缩放，直接返回原数据。与 sklearn scaler 接口兼容。"""
+    """Return input data unchanged through a scikit-learn-compatible interface."""
 
     def fit(self, X, y=None):
         return self

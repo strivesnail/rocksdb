@@ -903,20 +903,20 @@ bool LevelCompactionBuilder::PickFileToCompact() {
     vstorage_->GetOverlappingInputs(output_level_, &smallest, &largest,
                                     &output_level_inputs.files);
     if (output_level_inputs.empty()) {
-      // 检测trivial move：如果使用了自定义pri，需要标记
-      // 注意：trivial move的重写逻辑在PerformTrivialMove中处理
-      if (start_level_ > 0 && CustomCompactionPriManager::IsEnabled() && 
+
+
+      if (start_level_ > 0 && CustomCompactionPriManager::IsEnabled() &&
           g_custom_compaction_pri_manager != nullptr) {
         bool used_custom_pri = g_custom_compaction_pri_manager->ShouldUseCustomPri(start_level_);
-        (void)used_custom_pri;  // 抑制未使用警告，trivial move重写逻辑在PerformTrivialMove中处理
+        (void)used_custom_pri;
       }
-      
+
       if (start_level_ > 0 &&
           TryExtendNonL0TrivialMove(index,
                                     ioptions_.compaction_pri ==
                                         kRoundRobin /* only_expand_right */)) {
-        // Trivial move检测成功，如果使用了自定义pri，这里可以添加标记逻辑
-        // 注意：trivial move的重写逻辑在PerformTrivialMove中处理
+
+
         break;
       }
     } else {

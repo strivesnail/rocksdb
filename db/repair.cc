@@ -509,7 +509,7 @@ class Repairer {
                      status.ToString().c_str());
       if (status.ok() && phase2_enabled) {
         ROCKS_LOG_INFO(db_options_.info_log,
-            "[Repair] file #%" PRIu64 " (level=0) - 未预测，按 level 分配 handle 6",
+            "[Repair] file #%" PRIu64 " (level=0) - no prediction; assigned handle 6 by level",
             meta.fd.GetNumber());
         if (g_two_phase_write_manager &&
             g_two_phase_write_manager->IsInitialized() &&

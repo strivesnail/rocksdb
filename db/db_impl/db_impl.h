@@ -2424,7 +2424,7 @@ class DBImpl : public DB {
 
   // Helper function to rewrite a file atomically (read from source, write to temp, then rename)
   // Used when custom compaction pri was used but file is being trivial moved
-  // write_hint: handle for the destination level (trivial move 目标 level)，用于写 temp 文件时下发
+
   // REQUIRES: mutex held
   // Returns: Status of the rewrite operation
   Status RewriteFileAtomically(const std::string& source_path,
@@ -2432,7 +2432,7 @@ class DBImpl : public DB {
                                uint64_t expected_size,
                                Env::WriteLifeTimeHint write_hint = Env::WLTH_NOT_SET);
 
-  // 解耦：trivial move 时对 too-far 文件按目标 handle 重写。由 ROCKSDB_TRIVIAL_MOVE_REWRITE=1 独立控制。
+
   // REQUIRES: mutex held
   Status TryRewriteTooFarFilesOnTrivialMove(Compaction& c, LogBuffer* log_buffer);
 

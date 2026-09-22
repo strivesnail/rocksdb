@@ -9,8 +9,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// 基于预测删除时间的自定义 Compaction 选择器
-// 继承自 LevelCompactionPicker，在特定条件下使用优先队列选择文件
+
+
 class CustomCompactionPicker : public LevelCompactionPicker {
  public:
   CustomCompactionPicker(const ImmutableOptions& ioptions,
@@ -34,7 +34,7 @@ class CustomCompactionPicker : public LevelCompactionPicker {
       std::string* normal_reason = nullptr) override;
 
  private:
-  // 从优先队列选择文件进行 Compaction
+
   Compaction* SelectFileFromPriorityQueue(
       const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
       const MutableDBOptions& mutable_db_options,

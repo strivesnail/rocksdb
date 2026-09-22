@@ -1093,7 +1093,7 @@ void CompactionJob::FinalizeCompactionRun(
 Status CompactionJob::Run() {
   InitializeCompactionRun();
 
-  // [COMPACT_INPUT] 日志：本次 compaction 的输入文件及其存活时间（便于排查长生命周期）
+
   if (db_options_.info_log && g_two_phase_write_manager != nullptr && compact_ && compact_->compaction) {
     Compaction* c = compact_->compaction;
     const size_t num_levels = c->num_input_levels();
@@ -1346,7 +1346,7 @@ Status CompactionJob::Install(bool* compaction_released) {
   }
 
   CleanupCompaction();
-  
+
   return status;
 }
 
@@ -1973,7 +1973,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
                         start_cpu_micros, prev_cpu_micros, io_stats);
 
   NotifyOnSubcompactionCompleted(sub_compact);
-} 
+}
 
 void CompactionJob::FinalizeSubcompaction(
     SubcompactionState* sub_compact, Status status,
@@ -2101,7 +2101,7 @@ Status CompactionJob::FinishCompactionOutputFile(
 
   const uint64_t current_entries = outputs.NumEntries();
 
-  // 记录写入开始时间
+
   uint64_t t_write_start = db_options_.clock->NowMicros();
 
   s = outputs.Finish(s, seqno_to_time_mapping_);
@@ -2132,12 +2132,12 @@ Status CompactionJob::FinishCompactionOutputFile(
   // Finish and check for file errors
   IOStatus io_s = outputs.WriterSyncClose(s, db_options_.clock, stats_,
                                           db_options_.use_fsync);
-  
-  // 记录写入结束时间
+
+
   uint64_t t_write_end = db_options_.clock->NowMicros();
   uint64_t write_time_us = t_write_end - t_write_start;
-  
-  // 输出写入时间日志
+
+
   ROCKS_LOG_INFO(db_options_.info_log,
       "[TIMING_WRITE] file #%" PRIu64 " WriteToDisk=%" PRIu64 "us, size=%" PRIu64 " bytes",
       output_number, write_time_us, meta->fd.GetFileSize());
@@ -2162,7 +2162,7 @@ Status CompactionJob::FinishCompactionOutputFile(
     tp = outputs.GetTableProperties();
   }
 
-  // Phase2 二次写入：buffer 已写完，用真实 key range 算特征、解耦函数取 handle、注册、重写
+
   if (s.ok() && io_s.ok() && outputs.CurrentOutputUsesMemoryBuffer() &&
       g_two_phase_write_manager && g_two_phase_write_manager->IsInitialized() &&
       g_two_phase_write_manager->IsPhase2Enabled()) {
@@ -2201,7 +2201,7 @@ Status CompactionJob::FinishCompactionOutputFile(
     }
   }
 
-  // 直接写路径：若开启特征收集则打 [ML_FEATURES]（独立于预测/元数据注册，由 ROCKSDB_COLLECT_FEATURES 或 ROCKSDB_ML_COLLECT_ONLY 控制）
+
   if (s.ok() && io_s.ok() && !outputs.CurrentOutputUsesMemoryBuffer() &&
       g_two_phase_write_manager && g_two_phase_write_manager->IsInitialized() &&
       g_two_phase_write_manager->IsPhase2Enabled()) {
@@ -2214,7 +2214,7 @@ Status CompactionJob::FinishCompactionOutputFile(
                                 meta->fd.GetFileSize(), cfd);
     }
   }
-  // 直接写路径：解耦封装，仅注册 compaction 输出元数据（由 ROCKSDB_PHASE2_REGISTER_METADATA 控制）
+
   if (s.ok() && io_s.ok() && !outputs.CurrentOutputUsesMemoryBuffer() &&
       g_two_phase_write_manager && g_two_phase_write_manager->IsInitialized() &&
       g_two_phase_write_manager->IsPhase2Enabled()) {
@@ -2634,7 +2634,7 @@ void CompactionJob::RecordCompactionIOStats() {
 Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
                                                CompactionOutputs& outputs,
                                                const Slice& first_key) {
-  (void)first_key;  // Phase2 buffer 路径在 Finish 时用 meta smallest/largest
+  (void)first_key;
   assert(sub_compact != nullptr);
 
   // no need to lock because VersionSet::next_file_number_ is atomic
@@ -2644,15 +2644,15 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       "CompactionJob::OpenCompactionOutputFile::NewFileNumber", &file_number);
 #endif
   std::string fname = GetTableFileName(file_number);
-  
+
   // Check if we should write to tmp directory (Phase 2 mode)
   int output_level = sub_compact->compaction->output_level();
-  
+
   // Check environment variable first - this is the source of truth
   const char* enable_phase2_env = std::getenv("ROCKSDB_ENABLE_PHASE2");
-  bool enable_phase2_from_env = (enable_phase2_env != nullptr && 
+  bool enable_phase2_from_env = (enable_phase2_env != nullptr &&
                                   std::string(enable_phase2_env) == "1");
-  
+
   // Try to get manager from global variable, but don't rely on it
   TwoPhaseWriteManager* local_manager = g_two_phase_write_manager;
   (void)enable_phase2_from_env;
@@ -2678,7 +2678,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
   fo_copy.temperature = temperature;
   fo_copy.write_hint = write_hint_;
 
-  // Phase2 二次写入：由 ROCKSDB_PHASE2_USE_BUFFER=1 控制是否走 memory buffer，否则直接写文件
+
   bool use_memory_buffer = false;
   const char* use_buf_env = std::getenv("ROCKSDB_PHASE2_USE_BUFFER");
   if (use_buf_env != nullptr && std::string(use_buf_env) == "1" &&
@@ -2693,7 +2693,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
                      "[JOB %d] file #%" PRIu64
                      " CreateMemoryWritableFile failed, fallback to direct write",
                      job_id_, file_number);
-      local_manager->ReleaseMemoryBuffer(file_number);  // 回退：释放已创建的 buffer
+      local_manager->ReleaseMemoryBuffer(file_number);
     }
   }
 
@@ -2706,7 +2706,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
     s = Status::OK();
     io_s = IOStatus::OK();
   }
-  
+
   if (s.ok() && io_s.ok()) {
     outputs.AddOutputFilePath(fname);
   }
@@ -2724,7 +2724,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
         sub_compact->compaction->column_family_data()->GetName().c_str(),
         job_id_, file_number, s.ToString().c_str());
     LogFlush(db_options_.info_log);
-    // output_level 已在函数开头声明（第2500行），这里直接使用
+
     EventHelpers::LogAndNotifyTableFileCreationFinished(
         event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
         fname, job_id_, FileDescriptor(), kInvalidBlobFileNumber,
